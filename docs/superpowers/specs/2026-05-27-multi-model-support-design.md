@@ -34,6 +34,7 @@ main.py (FastAPI routing layer)
 - **Single-model constraint**: Only one model in memory at a time (Mac memory pressure)
 - **Switch flow**: unload() old model -> load() new model (~5-10s one-time cost)
 - **Lock**: asyncio.Lock prevents concurrent switch races
+- **Warmup**: After loading a new model, run a dummy inference (max_tokens=1) to warm up the compute graph. Both backends use the same warmup pattern.
 
 ## Endpoint Design
 
@@ -75,6 +76,7 @@ Migrates existing logic from main.py:
 - Loader: mlx_vlm.load()
 - Chat template: processor.tokenizer.apply_chat_template(messages, tools=...)
 - Tool call parsing: <|tool_call|> regex + JSON fallback
+- Tool schema conversion: convert_openai_tools_to_gemma() (migrated from main.py)
 - Config: mlx_vlm.utils.load_config()
 
 ### MiniCPMBackend
@@ -124,8 +126,9 @@ New implementation:
 | model/backends.py | **New** | ModelBackend base, GemmaBackend, MiniCPMBackend, ModelRegistry |
 | model/minicpm_tool_parser.py | **New** | MiniCPM5 XML tool call parser |
 | main.py | **Modify** | Remove hardcoded model + /generate route, use registry routing |
-| model/ml.py | **Modify** | Add enable_thinking to ChatCompletionRequest |
+| model/ml.py | **Modify** | Add enable_thinking to ChatCompletionRequest, remove dead GenerateRequest |
 | server_message_adapter.py | **Modify** | Rename normalize_messages_for_gemma -> normalize_messages |
+| server_message_adapter_test.py | **Modify** | Update test imports/references for renamed function |
 | minimal_pi_session.js | **Modify** | Add optional model parameter to createLocalPiSession |
 | multiturn_replay.js | **Modify** | Add optional model parameter |
 

@@ -55,6 +55,8 @@ Request adds enable_thinking field (used by MiniCPM5, ignored by Gemma):
 
 Routing: registry.get_or_load(body["model"]).generate(...).
 
+If `model` field is missing or empty, falls back to DEFAULT_MODEL env var (default: gemma-4-e2b-it-4bit).
+
 ### GET /v1/models
 
 Returns all registered models:
@@ -131,6 +133,8 @@ New implementation:
 | server_message_adapter_test.py | **Modify** | Update test imports/references for renamed function |
 | minimal_pi_session.js | **Modify** | Add optional model parameter to createLocalPiSession |
 | multiturn_replay.js | **Modify** | Add optional model parameter |
+| multiturn_replay.test.js | **Modify** | Update tests for model parameter if needed |
+| model/__init__.py | **Modify** | Export new backend classes (ModelBackend, GemmaBackend, MiniCPMBackend, ModelRegistry) |
 
 ## Configuration
 

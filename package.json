@@ -1,0 +1,9 @@
+{
+  "type": "module",
+  "scripts": {
+    "test": "node --test minimal_pi_session.test.js"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.2"
+  }
+}

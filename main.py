@@ -13,7 +13,7 @@ from typing import List, Optional, Literal
 
 from server_message_adapter import (
     build_tool_prompt_prefix,
-    normalize_messages_for_gemma,
+    normalize_messages,
 )
 
 MODEL_NAME = "mlx-community/gemma-4-e2b-it-4bit"
@@ -163,7 +163,7 @@ async def chat_completions(raw_req: Request):
     # 尝试用 Gemma 4 原生的 apply_chat_template(tools=...) 方式
     gemma_tools = convert_openai_tools_to_gemma(tools) if tools else None
 
-    messages_dict = normalize_messages_for_gemma(messages_raw)
+    messages_dict = normalize_messages(messages_raw)
 
     prompt = None
     if gemma_tools:

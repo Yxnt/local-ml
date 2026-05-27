@@ -69,7 +69,7 @@ def _format_tool_calls(tool_calls: list[dict[str, Any]]) -> str:
     )
 
 
-def normalize_messages_for_gemma(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
     normalized = []
     for raw_message in messages:
         role = raw_message.get("role", "")

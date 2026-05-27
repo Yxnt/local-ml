@@ -2,18 +2,18 @@ import unittest
 
 from server_message_adapter import (
     build_tool_prompt_prefix,
-    normalize_messages_for_gemma,
+    normalize_messages,
 )
 
 
-class NormalizeMessagesForGemmaTests(unittest.TestCase):
+class NormalizeMessagesTests(unittest.TestCase):
     def test_preserves_existing_system_prompt(self):
         messages = [
             {"role": "system", "content": "Custom client prompt."},
             {"role": "user", "content": "Run ls -F and output the result verbatim"},
         ]
 
-        normalized = normalize_messages_for_gemma(messages)
+        normalized = normalize_messages(messages)
 
         self.assertEqual(normalized[0]["role"], "system")
         self.assertEqual(normalized[0]["content"], "Custom client prompt.")
@@ -43,7 +43,7 @@ class NormalizeMessagesForGemmaTests(unittest.TestCase):
             },
         ]
 
-        normalized = normalize_messages_for_gemma(messages)
+        normalized = normalize_messages(messages)
 
         self.assertEqual(normalized[1]["role"], "assistant")
         self.assertIn('"name": "bash"', normalized[1]["content"])
@@ -73,7 +73,7 @@ class NormalizeMessagesForGemmaTests(unittest.TestCase):
             {"role": "user", "content": "Run ls -F"},
         ]
 
-        normalized = normalize_messages_for_gemma(messages)
+        normalized = normalize_messages(messages)
         prefixed = build_tool_prompt_prefix(normalized, tools)
 
         self.assertTrue(prefixed[0]["content"].startswith("You can use tools by outputting"))

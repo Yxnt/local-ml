@@ -67,10 +67,6 @@ Returns all registered models:
 }
 ```
 
-### POST /generate (legacy)
-
-Kept for backward compatibility. Uses default model.
-
 ## Backend Implementations
 
 ### GemmaBackend
@@ -90,14 +86,48 @@ New implementation:
 - Generation: mlx_lm.generate()
 - Model ID: openbmb/MiniCPM5-1B-MLX
 
+## server_message_adapter 归属
+
+当前 server_message_adapter.py 中的函数命名带 "gemma"，但逻辑是通用的（OpenAI format -> pure role/content）。重构方案:
+- normalize_messages_for_gemma -> normalize_messages (通用，两个 backend 共用)
+- build_tool_prompt_prefix, format_tools_for_prompt, extract_content 保持不变（已是通用名)
+- server_message_adapter.py 文件名不变，避免不必要的文件重命名
+- 两个 backend 都调用 normalize_messages 处理输入，再各自调用自己的 apply_chat_template
+
+## Streaming 策略
+
+两个 backend 统一使用 same streaming approach:
+- mlx_vlm (Gemma) 和 mlx_lm (MiniCPM5) 都不支持真 token-level streaming
+- 策略: 先完整生成 output_text，再分段推送 SSE events
+- 流式 tool_calls: 先推 tool call header，再分段推 arguments
+- 流式 text: 按固定 chunk size (3 chars) 分段推送
+- 流式逻辑在 main.py 路由层实现，不在 backend 内部
+
+## JS 客户端兼容
+
+### minimal_pi_session.js
+- DEFAULT_API_BASE 和 LOCAL_MODEL_ID 保持为默认值
+- createLocalPiSession() 增加可选 model 参数，默认使用 LOCAL_MODEL_ID
+- 调用方可传入不同 model name 来使用不同模型
+
+### multiturn_replay.js
+- 增加可选 model 参数，默认使用现有 LOCAL_MODEL_ID
+- 发送请求时使用传入的 model name
+
+### main.js
+- 简单 demo，不需要改动（使用默认模型即可）
+
 ## File Changes
 
 | File | Action | Description |
 |------|--------|-------------|
 | model/backends.py | **New** | ModelBackend base, GemmaBackend, MiniCPMBackend, ModelRegistry |
 | model/minicpm_tool_parser.py | **New** | MiniCPM5 XML tool call parser |
-| main.py | **Modify** | Remove hardcoded model, use registry for routing |
+| main.py | **Modify** | Remove hardcoded model + /generate route, use registry routing |
 | model/ml.py | **Modify** | Add enable_thinking to ChatCompletionRequest |
+| server_message_adapter.py | **Modify** | Rename normalize_messages_for_gemma -> normalize_messages |
+| minimal_pi_session.js | **Modify** | Add optional model parameter to createLocalPiSession |
+| multiturn_replay.js | **Modify** | Add optional model parameter |
 
 ## Configuration
 

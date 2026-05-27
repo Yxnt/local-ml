@@ -8,38 +8,38 @@ Extend the local ML inference stack to support multiple models (Gemma 4 + MiniCP
 
 ```
 main.py (FastAPI routing layer)
-  ├── ModelRegistry
-  │     ├── models: dict[str, ModelMeta]       # registered models (metadata only)
-  │     ├── active: ModelBackend | None         # currently loaded model
-  │     ├── get_or_load(name) -> ModelBackend   # switch if needed
-  │     └── list_models() -> list[str]
-  │
-  ├── ModelBackend (abstract base)
-  │     ├── load()
-  │     ├── unload()
-  │     ├── generate(messages, tools, **kwargs) -> str
-  │     ├── apply_chat_template(messages, tools, **kwargs) -> str
-  │     └── parse_tool_calls(text) -> list[dict]
-  │
-  ├── GemmaBackend(mlx_vlm)
-  │     └── migrates existing main.py logic
-  │
-  └── MiniCPMBackend(mlx_lm)
-        └── new implementation
+  +-- ModelRegistry
+  |     +-- models: dict[str, ModelMeta]       # registered models (metadata only)
+  |     +-- active: ModelBackend | None         # currently loaded model
+  |     +-- get_or_load(name) -> ModelBackend   # switch if needed
+  |     +-- list_models() -> list[str]
+  |
+  +-- ModelBackend (abstract base)
+  |     +-- load()
+  |     +-- unload()
+  |     +-- generate(messages, tools, **kwargs) -> str
+  |     +-- apply_chat_template(messages, tools, **kwargs) -> str
+  |     +-- parse_tool_calls(text) -> list[dict]
+  |
+  +-- GemmaBackend(mlx_vlm)
+  |     +-- migrates existing main.py logic
+  |
+  +-- MiniCPMBackend(mlx_lm)
+        +-- new implementation
 ```
 
 ## Model Loading Strategy
 
 - **Lazy load**: Models register metadata at startup; weights load on first request
 - **Single-model constraint**: Only one model in memory at a time (Mac memory pressure)
-- **Switch flow**: `unload()` old model -> `load()` new model (~5-10s one-time cost)
+- **Switch flow**: unload() old model -> load() new model (~5-10s one-time cost)
 - **Lock**: asyncio.Lock prevents concurrent switch races
 
 ## Endpoint Design
 
 ### POST /v1/chat/completions
 
-Request adds `enable_thinking` field (used by MiniCPM5, ignored by Gemma):
+Request adds enable_thinking field (used by MiniCPM5, ignored by Gemma):
 
 ```json
 {
@@ -52,7 +52,7 @@ Request adds `enable_thinking` field (used by MiniCPM5, ignored by Gemma):
 }
 ```
 
-Routing: `registry.get_or_load(body["model"]).generate(...)`.
+Routing: registry.get_or_load(body["model"]).generate(...).
 
 ### GET /v1/models
 
@@ -76,34 +76,34 @@ Kept for backward compatibility. Uses default model.
 ### GemmaBackend
 
 Migrates existing logic from main.py:
-- Loader: `mlx_vlm.load()`
-- Chat template: `processor.tokenizer.apply_chat_template(messages, tools=...)`
-- Tool call parsing: `<|tool_call>` regex + JSON fallback
-- Config: `mlx_vlm.utils.load_config()`
+- Loader: mlx_vlm.load()
+- Chat template: processor.tokenizer.apply_chat_template(messages, tools=...)
+- Tool call parsing: <|tool_call|> regex + JSON fallback
+- Config: mlx_vlm.utils.load_config()
 
 ### MiniCPMBackend
 
 New implementation:
-- Loader: `mlx_lm.load()`
-- Chat template: `tokenizer.apply_chat_template(messages, tools=..., enable_thinking=...)`
-- Tool call parsing: XML-style `<function>` blocks (MiniCPM5 native format)
-- Generation: `mlx_lm.generate()`
-- Model ID: `openbmb/MiniCPM5-1B-MLX`
+- Loader: mlx_lm.load()
+- Chat template: tokenizer.apply_chat_template(messages, tools=..., enable_thinking=...)
+- Tool call parsing: XML-style function blocks (MiniCPM5 native format)
+- Generation: mlx_lm.generate()
+- Model ID: openbmb/MiniCPM5-1B-MLX
 
 ## File Changes
 
 | File | Action | Description |
 |------|--------|-------------|
-| `model/backends.py` | **New** | ModelBackend base, GemmaBackend, MiniCPMBackend, ModelRegistry |
-| `model/minicpm_tool_parser.py` | **New** | MiniCPM5 XML tool call parser |
-| `main.py` | **Modify** | Remove hardcoded model, use registry for routing |
-| `model/ml.py` | **Modify** | Add `enable_thinking` to ChatCompletionRequest |
+| model/backends.py | **New** | ModelBackend base, GemmaBackend, MiniCPMBackend, ModelRegistry |
+| model/minicpm_tool_parser.py | **New** | MiniCPM5 XML tool call parser |
+| main.py | **Modify** | Remove hardcoded model, use registry for routing |
+| model/ml.py | **Modify** | Add enable_thinking to ChatCompletionRequest |
 
 ## Configuration
 
 Environment variables:
-- `DEFAULT_MODEL`: model to load on startup (default: `gemma-4-e2b-it-4bit`)
-- `MODELS_CONFIG`: optional JSON override for model registry entries
+- DEFAULT_MODEL: model to load on startup (default: gemma-4-e2b-it-4bit)
+- MODELS_CONFIG: optional JSON override for model registry entries
 
 Registry defaults (hardcoded, overridable):
 
@@ -134,4 +134,22 @@ XML-style output, parsed by regex:
 
 ```xml
 <function=get_weather>
-<parameter=city>北京
+  <parameter=city>Beijing</parameter>
+</function>
+```
+
+Parser extracts function name and parameter key-value pairs from XML tags.
+
+## Error Handling
+
+- **Unknown model**: Return 400 with list of available models
+- **Model load failure**: Return 503 with error details, do not crash server
+- **Concurrent switch**: asyncio.Lock queues requests during model switch
+- **Parse failure**: If tool call parsing fails, return raw text as content (graceful fallback)
+
+## Testing Strategy
+
+1. **Unit tests**: Test each backend independently (mock MLX loaders)
+2. **Integration tests**: Test model switching flow with real models
+3. **Tool call parsing**: Test XML parser with various MiniCPM5 output formats
+4. **Backward compatibility**: Existing tests (server_message_adapter_test.py, minimal_pi_session.test.js) must still pass

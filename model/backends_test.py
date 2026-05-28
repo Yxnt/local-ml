@@ -7,6 +7,7 @@ from model.backends import (
     DEFAULT_MODELS,
     GemmaBackend,
     MiniCPMBackend,
+    MiniCPMVBackend,
     ModelRegistry,
 )
 
@@ -188,3 +189,38 @@ class TestMiniCPMBackendParseToolCalls:
     def test_no_function_tags_returns_empty(self):
         text = "Here is some text without any tool calls."
         assert self.backend.parse_tool_calls(text) == []
+
+
+# ---------------------------------------------------------------------------
+# MiniCPMVBackend.parse_tool_calls
+# ---------------------------------------------------------------------------
+
+
+class TestMiniCPMVBackendParseToolCalls:
+    def setup_method(self):
+        self.backend = MiniCPMVBackend()
+
+    def test_json_format_single(self):
+        text = '```json\n{"name": "bash", "arguments": {"command": "ls"}}\n```'
+        calls = self.backend.parse_tool_calls(text)
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "bash"
+        args = json.loads(calls[0]["function"]["arguments"])
+        assert args["command"] == "ls"
+
+    def test_json_format_no_markdown(self):
+        text = '{"name": "click", "arguments": {"x": 100, "y": 200}}'
+        calls = self.backend.parse_tool_calls(text)
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "click"
+        args = json.loads(calls[0]["function"]["arguments"])
+        assert args["x"] == 100
+        assert args["y"] == 200
+
+    def test_empty_text_returns_empty(self):
+        assert self.backend.parse_tool_calls("") == []
+        assert self.backend.parse_tool_calls("Just a regular response.") == []
+
+    def test_default_models_includes_minicpmv(self):
+        assert "minicpm-v-4_6" in DEFAULT_MODELS
+        assert DEFAULT_MODELS["minicpm-v-4_6"]["backend"] == "minicpmv"

@@ -2,12 +2,18 @@
 
 The soul defines WHO the agent is and HOW it should behave.
 It's the core identity that persists across all interactions.
+
+Supports both JSON and Markdown formats:
+- soul.json: Structured data
+- soul.md: Human-readable, editable
 """
 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -68,20 +74,143 @@ class Soul:
         """Create from dictionary."""
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
+    def to_markdown(self) -> str:
+        """Convert to human-readable markdown."""
+        values_md = "\n".join(f"- {v}" for v in self.values)
+        expertise_md = ", ".join(self.expertise)
+        languages_md = ", ".join(self.languages)
+        rules_md = "\n".join(f"- {r}" for r in self.rules)
+
+        return f"""# Soul - {self.name}
+
+## 基本信息
+
+- **名称**: {self.name}
+- **版本**: {self.version}
+- **更新时间**: {self.updated_at or datetime.now().isoformat()}
+
+## 性格特点
+
+{self.personality}
+
+## 核心价值
+
+{values_md}
+
+## 沟通风格
+
+{self.communication_style}
+
+## 专业领域
+
+{expertise_md}
+
+## 语言能力
+
+{languages_md}
+
+## 行为准则
+
+{rules_md}
+
+## 响应模板
+
+- **问候**: {self.greeting}
+- **告别**: {self.farewell}
+- **不确定**: {self.uncertainty}
+"""
+
+    @classmethod
+    def from_markdown(cls, content: str) -> Soul:
+        """Parse markdown content into Soul."""
+        soul = cls()
+
+        # Parse name from title
+        title_match = re.search(r"^#\s+.*?-\s*(.+)$", content, re.MULTILINE)
+        if title_match:
+            soul.name = title_match.group(1).strip()
+
+        # Parse version
+        version_match = re.search(r"\*\*版本\*\*:\s*(.+)", content)
+        if version_match:
+            soul.version = version_match.group(1).strip()
+
+        # Parse personality
+        personality_match = re.search(r"## 性格特点\n\n(.+?)(?:\n##|\Z)", content, re.DOTALL)
+        if personality_match:
+            soul.personality = personality_match.group(1).strip()
+
+        # Parse communication style
+        style_match = re.search(r"## 沟通风格\n\n(.+?)(?:\n##|\Z)", content, re.DOTALL)
+        if style_match:
+            soul.communication_style = style_match.group(1).strip()
+
+        # Parse values (bullet list)
+        values_section = re.search(r"## 核心价值\n\n(.*?)(?:\n##|\Z)", content, re.DOTALL)
+        if values_section:
+            soul.values = cls._parse_bullet_list(values_section.group(1))
+
+        # Parse expertise (comma separated)
+        expertise_match = re.search(r"## 专业领域\n\n(.+?)(?:\n##|\Z)", content, re.DOTALL)
+        if expertise_match:
+            soul.expertise = [e.strip() for e in expertise_match.group(1).split(",")]
+
+        # Parse rules (bullet list)
+        rules_section = re.search(r"## 行为准则\n\n(.*?)(?:\n##|\Z)", content, re.DOTALL)
+        if rules_section:
+            soul.rules = cls._parse_bullet_list(rules_section.group(1))
+
+        # Parse response templates
+        greeting_match = re.search(r"\*\*问候\*\*:\s*(.+)", content)
+        if greeting_match:
+            soul.greeting = greeting_match.group(1).strip()
+
+        farewell_match = re.search(r"\*\*告别\*\*:\s*(.+)", content)
+        if farewell_match:
+            soul.farewell = farewell_match.group(1).strip()
+
+        uncertainty_match = re.search(r"\*\*不确定\*\*:\s*(.+)", content)
+        if uncertainty_match:
+            soul.uncertainty = uncertainty_match.group(1).strip()
+
+        return soul
+
+    @staticmethod
+    def _parse_bullet_list(text: str) -> list[str]:
+        """Parse markdown bullet list."""
+        items = []
+        for line in text.strip().split("\n"):
+            line = line.strip()
+            if line.startswith("- "):
+                items.append(line[2:].strip())
+            elif line.startswith("* "):
+                items.append(line[2:].strip())
+        return items
+
     def save(self, path: str | Path) -> None:
-        """Save soul to JSON file."""
+        """Save soul to JSON or Markdown file based on extension."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2))
+
+        if path.suffix == ".md":
+            self.updated_at = datetime.now().isoformat()
+            path.write_text(self.to_markdown(), encoding="utf-8")
+        else:
+            path.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
 
     @classmethod
     def load(cls, path: str | Path) -> Soul:
-        """Load soul from JSON file."""
+        """Load soul from JSON or Markdown file."""
         path = Path(path)
         if not path.exists():
             return cls()
-        data = json.loads(path.read_text())
-        return cls.from_dict(data)
+
+        content = path.read_text(encoding="utf-8")
+
+        if path.suffix == ".md":
+            return cls.from_markdown(content)
+        else:
+            return cls.from_dict(json.loads(content))
 
     def get_system_prompt(self) -> str:
         """Generate system prompt from soul definition."""

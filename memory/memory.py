@@ -10,10 +10,12 @@ Memory types:
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 
@@ -322,6 +324,75 @@ class MemoryStore:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
+
+    def export_to_markdown(self, path: str | Path) -> None:
+        """Export memories to a markdown file."""
+        from pathlib import Path
+
+        memories = self.get_recent_memories(limit=1000)
+
+        # Group by type
+        by_type: dict[str, list[Memory]] = {}
+        for m in memories:
+            by_type.setdefault(m.type.value, []).append(m)
+
+        type_labels = {
+            "fact": "事实",
+            "preference": "偏好",
+            "experience": "经历",
+            "conversation": "对话",
+        }
+
+        lines = ["# Memory\n"]
+        for type_name, label in type_labels.items():
+            items = by_type.get(type_name, [])
+            if not items:
+                continue
+
+            lines.append(f"\n## {label}\n")
+            for m in items:
+                importance = "⭐" * int(m.importance * 5)
+                lines.append(f"- [{importance}] {m.content} _{m.created_at}_")
+
+        Path(path).write_text("\n".join(lines), encoding="utf-8")
+
+    def import_from_markdown(self, path: str | Path) -> int:
+        """Import memories from a markdown file."""
+        from pathlib import Path
+
+        content = Path(path).read_text(encoding="utf-8")
+
+        # Parse markdown sections
+        current_type = MemoryType.FACT
+        count = 0
+
+        type_map = {
+            "事实": MemoryType.FACT,
+            "偏好": MemoryType.PREFERENCE,
+            "经历": MemoryType.EXPERIENCE,
+            "对话": MemoryType.CONVERSATION,
+        }
+
+        for line in content.split("\n"):
+            line = line.strip()
+
+            # Check for section header
+            if line.startswith("## "):
+                label = line[3:].strip()
+                if label in type_map:
+                    current_type = type_map[label]
+                continue
+
+            # Parse memory item
+            if line.startswith("- ["):
+                # Extract content after importance stars
+                match = re.match(r"-\s+\[.*?\]\s+(.+?)(?:\s+_.+?_)?$", line)
+                if match:
+                    memory_content = match.group(1).strip()
+                    self.add_memory(memory_content, current_type)
+                    count += 1
+
+        return count
 
     @staticmethod
     def _pack_embedding(embedding: list[float]) -> bytes:

@@ -16,7 +16,7 @@ class TestSoul:
         assert soul.name == "Local ML Assistant"
         assert len(soul.rules) > 0
 
-    def test_save_load(self, tmp_path):
+    def test_save_load_json(self, tmp_path):
         soul = Soul(name="Test Bot", personality="测试")
         path = tmp_path / "soul.json"
         soul.save(path)
@@ -24,6 +24,22 @@ class TestSoul:
         loaded = Soul.load(path)
         assert loaded.name == "Test Bot"
         assert loaded.personality == "测试"
+
+    def test_save_load_markdown(self, tmp_path):
+        soul = Soul(name="Test Bot", personality="测试", rules=["规则1", "规则2"])
+        path = tmp_path / "soul.md"
+        soul.save(path)
+
+        # Verify markdown content
+        content = path.read_text()
+        assert "Test Bot" in content
+        assert "规则1" in content
+
+        # Load back
+        loaded = Soul.load(path)
+        assert loaded.name == "Test Bot"
+        assert loaded.personality == "测试"
+        assert "规则1" in loaded.rules
 
     def test_system_prompt(self):
         soul = Soul()
@@ -37,11 +53,26 @@ class TestUserProfile:
         user = UserProfile()
         assert user.timezone == "Asia/Shanghai"
 
-    def test_save_load(self, tmp_path):
+    def test_save_load_json(self, tmp_path):
         user = UserProfile(name="Yxnt", role="工程师")
         path = tmp_path / "user.json"
         user.save(path)
 
+        loaded = UserProfile.load(path)
+        assert loaded.name == "Yxnt"
+        assert loaded.role == "工程师"
+
+    def test_save_load_markdown(self, tmp_path):
+        user = UserProfile(name="Yxnt", role="工程师", timezone="Asia/Shanghai")
+        path = tmp_path / "user.md"
+        user.save(path)
+
+        # Verify markdown content
+        content = path.read_text()
+        assert "Yxnt" in content
+        assert "工程师" in content
+
+        # Load back
         loaded = UserProfile.load(path)
         assert loaded.name == "Yxnt"
         assert loaded.role == "工程师"
@@ -101,6 +132,27 @@ class TestMemoryStore:
         assert stats["total_memories"] == 2
         assert stats["memories_fact"] == 1
         assert stats["memories_preference"] == 1
+
+        store.disconnect()
+
+    def test_export_import_markdown(self, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        store = MemoryStore(db_path)
+        store.connect()
+        store.init_tables()
+
+        # Add memories
+        store.add_memory("用户喜欢 Python", MemoryType.PREFERENCE, 0.8)
+        store.add_memory("用户的生日是 1990-01-01", MemoryType.FACT, 0.9)
+
+        # Export to markdown
+        md_path = tmp_path / "memories.md"
+        store.export_to_markdown(md_path)
+
+        # Verify markdown content
+        content = md_path.read_text()
+        assert "偏好" in content
+        assert "Python" in content
 
         store.disconnect()
 

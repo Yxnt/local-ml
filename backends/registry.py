@@ -12,6 +12,7 @@ from backends.base import ModelBackend
 from backends.gemma import GemmaBackend
 from backends.minicpm import MiniCPMBackend
 from backends.minicpmv import MiniCPMVBackend
+from backends.remote import RemoteBackend
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODELS: dict[str, dict[str, str]] = {
+    # 本地模型
     "gemma-4-e2b-it-4bit": {
         "backend": "gemma",
         "model_id": "mlx-community/gemma-4-e2b-it-4bit",
@@ -32,6 +34,19 @@ DEFAULT_MODELS: dict[str, dict[str, str]] = {
         "backend": "minicpmv",
         "model_id": "openbmb/MiniCPM-V-4.6",
     },
+    # 远程模型 (需要 API Key)
+    "mimo-v2.5-pro": {
+        "backend": "remote",
+        "model_id": "mimo-v2.5-pro",
+        "provider": "xiaomi",
+        "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+    },
+    "mimo-v2.5-flash": {
+        "backend": "remote",
+        "model_id": "mimo-v2.5-flash",
+        "provider": "xiaomi",
+        "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+    },
 }
 
 # Map internal backend names to public API names (matching design spec)
@@ -39,6 +54,7 @@ _BACKEND_DISPLAY_NAMES: dict[str, str] = {
     "gemma": "mlx_vlm",
     "minicpm": "mlx_lm",
     "minicpmv": "mlx_vlm",
+    "remote": "api",
 }
 
 # Backend name -> class mapping
@@ -46,6 +62,7 @@ _BACKEND_CLASSES: dict[str, type[ModelBackend]] = {
     "gemma": GemmaBackend,
     "minicpm": MiniCPMBackend,
     "minicpmv": MiniCPMVBackend,
+    "remote": RemoteBackend,
 }
 
 
@@ -86,10 +103,29 @@ class ModelRegistry:
                 logger.warning("Invalid MODELS_CONFIG JSON: %s", e)
 
         for name, cfg in models.items():
-            backend_cls = _BACKEND_CLASSES.get(cfg["backend"])
-            if backend_cls is None:
-                raise ValueError(f"Unknown backend type: {cfg['backend']}")
-            backend = backend_cls()
+            backend_type = cfg["backend"]
+
+            if backend_type == "remote":
+                # 远程模型需要 API Key
+                api_key_env = cfg.get("api_key_env", f"{name.upper().replace('-', '_')}_API_KEY")
+                api_key = os.environ.get(api_key_env, "")
+
+                if not api_key:
+                    logger.info("Skipping remote model %s (no API key: %s)", name, api_key_env)
+                    continue
+
+                backend = RemoteBackend(
+                    base_url=cfg.get("base_url", ""),
+                    api_key=api_key,
+                    model_id=cfg["model_id"],
+                    provider=cfg.get("provider", "openai"),
+                )
+            else:
+                backend_cls = _BACKEND_CLASSES.get(backend_type)
+                if backend_cls is None:
+                    raise ValueError(f"Unknown backend type: {backend_type}")
+                backend = backend_cls()
+
             # Attach model_id so get_or_load can use it
             backend._default_model_id = cfg["model_id"]  # type: ignore[attr-defined]
             self.register(name, backend)

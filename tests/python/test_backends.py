@@ -1,9 +1,9 @@
-"""Tests for model/backends.py -- strategy-pattern backends and ModelRegistry."""
+"""Tests for backends -- strategy-pattern backends and ModelRegistry."""
 
 import json
 import pytest
 
-from model.backends import (
+from backends import (
     DEFAULT_MODELS,
     GemmaBackend,
     MiniCPMBackend,

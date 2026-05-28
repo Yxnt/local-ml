@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { SYSTEM_PROMPT, createLocalPiSession } from "./minimal_pi_session.js";
+import { SYSTEM_PROMPT, createLocalPiSession } from "../../js/minimal_pi_session.js";
 
 test("createLocalPiSession uses a minimal prompt and a single bash tool", async () => {
   const { session } = await createLocalPiSession({

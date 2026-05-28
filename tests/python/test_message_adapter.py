@@ -1,6 +1,6 @@
 import unittest
 
-from server_message_adapter import (
+from server.message_adapter import (
     build_tool_prompt_prefix,
     normalize_messages,
 )

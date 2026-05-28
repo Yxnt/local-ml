@@ -6,7 +6,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional, Literal
 
-from model.backends import ModelRegistry
+from backends import ModelRegistry
 
 # ====== Pydantic request types (for FastAPI validation) ======
 

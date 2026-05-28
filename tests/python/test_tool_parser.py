@@ -1,6 +1,6 @@
 import unittest
 import json
-from model.minicpm_tool_parser import parse_mcp_tool_calls
+from backends.tool_parser import parse_mcp_tool_calls
 
 
 class ParseMcpToolCallsTests(unittest.TestCase):

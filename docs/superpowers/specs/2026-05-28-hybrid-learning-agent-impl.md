@@ -9,18 +9,19 @@ server/
 ├── remote_analyzer.py       # 远程 LLM 分析
 ├── rule_manager.py          # 规则管理
 ├── learning_controller.py   # 学习控制
-└── confidence_evaluator.py  # 置信度评估
+├── confidence_evaluator.py  # 置信度评估
+└── session_sanitizer.py     # 会话级脱敏器 (新增)
 
 memory/
-├── memory.py                # 扩展规则存储
-└── rule_store.py            # 规则专用存储
+└── memory.py                # 扩展支持 RULE 类型
 
 tests/
 ├── test_hybrid_agent.py
 ├── test_local_processor.py
 ├── test_remote_analyzer.py
 ├── test_rule_manager.py
-└── test_learning_controller.py
+├── test_learning_controller.py
+└── test_session_sanitizer.py
 ```
 
 ## 数据结构定义
@@ -139,6 +140,85 @@ class SanitizedContext:
     timestamp: datetime
 ```
 
+### 5. SessionSanitizer (会话级脱敏器)
+
+```python
+# server/session_sanitizer.py
+
+@dataclass
+class EntityMapping:
+    """实体映射"""
+    original: str                        # 原始实体名
+    placeholder: str                     # 占位符
+    entity_type: str                     # person/thing/place
+    created_at: datetime
+
+class SessionSanitizer:
+    """会话级脱敏器 - 保证同一会话内实体映射一致"""
+
+    def __init__(self):
+        self.entity_mappings: dict[str, EntityMapping] = {}  # 原始 → 映射
+        self.reverse_mappings: dict[str, EntityMapping] = {}  # 占位符 → 映射
+        self.counters: dict[str, int] = {                     # 计数器
+            "PERSON": 0, "THING": 0, "PLACE": 0, "TOPIC": 0
+        }
+
+    def sanitize(self, text: str) -> SanitizedText:
+        """脱敏文本 - 复用已有映射，保持一致性"""
+        sanitized = text
+
+        # 1. 先替换已知实体
+        for original, mapping in self.entity_mappings.items():
+            sanitized = sanitized.replace(original, mapping.placeholder)
+
+        # 2. 检测并映射新实体
+        new_entities = self._detect_new_entities(sanitized)
+        for entity in new_entities:
+            entity_type = self._classify_entity(entity)
+            placeholder = f"[{entity_type}_{self.counters[entity_type]}]"
+            self.counters[entity_type] += 1
+
+            mapping = EntityMapping(
+                original=entity,
+                placeholder=placeholder,
+                entity_type=entity_type,
+                created_at=datetime.now()
+            )
+            self.entity_mappings[entity] = mapping
+            self.reverse_mappings[placeholder] = mapping
+
+            sanitized = sanitized.replace(entity, placeholder)
+
+        # 3. 脱敏结构化数据 (邮箱、电话等)
+        sanitized, struct_mapping = self._sanitize_structured(sanitized)
+
+        return SanitizedText(
+            original=text,
+            sanitized=sanitized,
+            mapping={**{m.placeholder: m.original for m in self.entity_mappings.values()},
+                     **struct_mapping},
+            level=self._detect_level(text)
+        )
+
+    def desanitize(self, text: str) -> str:
+        """还原占位符为原始实体"""
+        result = text
+        for placeholder, mapping in self.reverse_mappings.items():
+            result = result.replace(placeholder, mapping.original)
+        return result
+
+    def get_sanitized_history(self, history: list[str]) -> list[str]:
+        """使用相同映射脱敏历史记录"""
+        return [self.sanitize(msg).sanitized for msg in history]
+
+    def get_entity_types_only(self) -> list[dict]:
+        """获取实体类型 (不含名称) - 用于发送给远程"""
+        return [
+            {"type": m.entity_type, "placeholder": m.placeholder}
+            for m in self.entity_mappings.values()
+        ]
+```
+
 ## 详细实现
 
 ### 1. HybridAgent (主入口)
@@ -152,7 +232,7 @@ class HybridAgent:
     def __init__(self, config: dict):
         # 初始化各组件
         self.memory = MemoryManager(config["memory"])
-        self.sanitizer = DataSanitizer(config["privacy"])
+        self.session_sanitizer = SessionSanitizer()  # 会话级脱敏器
         self.local_model = self._init_local_model(config["local"])
         self.remote_model = self._init_remote_model(config["remote"])
 
@@ -162,12 +242,9 @@ class HybridAgent:
             self.memory,
             self.rule_manager
         )
-        self.remote_analyzer = RemoteAnalyzer(
-            self.remote_model,
-            self.sanitizer
-        )
+        self.remote_analyzer = RemoteAnalyzer(self.remote_model)
         self.learning_controller = LearningController(
-            self.sanitizer,
+            self.session_sanitizer,
             self.remote_analyzer,
             self.rule_manager,
             config["learning"]
@@ -180,16 +257,35 @@ class HybridAgent:
         result = await self.local_processor.process(user_input)
 
         # 2. 判断是否需要远程学习
-        await self.learning_controller.maybe_learn(user_input, result)
+        if result.confidence < 0.9:
+            # 告诉用户正在分析
+            yield "正在分析这个问题..."
+
+            # 异步学习
+            learning_task = asyncio.create_task(
+                self.learning_controller.learn(user_input, result)
+            )
+
+            # 如果是连续对话，等待学习完成
+            if self._is_followup_question(user_input):
+                await learning_task
+                # 用新规则重新处理
+                result = await self.local_processor.process(user_input)
 
         # 3. 更新规则统计
         for rule_id in result.rules_applied:
-            await self.rule_manager.update_rule_stats(rule_id, success=True)
+            await self.rule_manager.update_rule_stats(rule_id, result)
 
         # 4. 保存对话到记忆
         await self._save_conversation(user_input, result.answer)
 
         return result.answer
+
+    def _is_followup_question(self, user_input: str) -> bool:
+        """判断是否是连续对话"""
+        # 检查是否有代词引用
+        pronouns = ["他", "她", "它", "这个", "那个", "这", "那"]
+        return any(p in user_input for p in pronouns)
 
     async def _save_conversation(self, user_input: str, answer: str):
         """保存对话到记忆"""
@@ -486,8 +582,8 @@ class RuleManager:
 
         return self._to_learning_rule(rule_data)
 
-    async def update_rule_stats(self, rule_id: str, success: bool):
-        """更新规则统计"""
+    async def update_rule_stats(self, rule_id: str, result: LocalResult):
+        """更新规则统计 - 基于置信度判断成功"""
         # 从记忆中获取规则
         rules = await self.memory.search(
             query=rule_id,
@@ -498,24 +594,38 @@ class RuleManager:
         if rules:
             rule = rules[0]
             rule.metadata["usage_count"] += 1
-            if success:
+
+            # 根据置信度判断是否成功
+            if result.confidence > 0.8:
                 rule.metadata["success_count"] += 1
+
+            # 更新状态
+            success_rate = rule.metadata["success_count"] / rule.metadata["usage_count"]
+            if success_rate < 0.3 and rule.metadata["usage_count"] >= 5:
+                rule.metadata["status"] = "inactive"  # 成功率太低，标记为失效
+
             await self.memory.update_memory(rule.id, metadata=rule.metadata)
 
     def _get_priority(self, rule: LearningRule) -> float:
-        """计算规则优先级"""
+        """计算规则优先级 - 成功率 + 使用次数加权"""
         base_priority = {
             "user_taught": 100,
             "remote_feedback": 80,
             "local_pattern": 60,
         }.get(rule.source, 40)
 
-        # 根据成功率调整
-        if rule.usage_count > 0:
-            success_rate = rule.success_count / rule.usage_count
-            return base_priority * success_rate
+        # 未测试的规则打折
+        if rule.usage_count == 0:
+            return base_priority * 0.6
 
-        return base_priority
+        # 使用次数越多，越信任成功率
+        trust = min(rule.usage_count / 10, 1.0)  # 用10次就完全信任
+        success_rate = rule.success_count / rule.usage_count
+
+        # 加权成功率
+        effective_rate = success_rate * trust + 0.5 * (1 - trust)
+
+        return base_priority * effective_rate
 
     def _extract_keywords(self, text: str) -> list[str]:
         """提取关键词用于规则匹配"""
@@ -538,12 +648,12 @@ class LearningController:
 
     def __init__(
         self,
-        sanitizer: DataSanitizer,
+        session_sanitizer: SessionSanitizer,
         remote_analyzer: RemoteAnalyzer,
         rule_manager: RuleManager,
         config: dict
     ):
-        self.sanitizer = sanitizer
+        self.session_sanitizer = session_sanitizer
         self.remote = remote_analyzer
         self.rule_manager = rule_manager
         self.config = config
@@ -554,46 +664,41 @@ class LearningController:
         self.last_hourly_reset = datetime.now()
         self.last_daily_reset = datetime.now()
 
-    async def maybe_learn(self, user_input: str, result: LocalResult):
-        """判断是否需要学习"""
+    async def learn(self, user_input: str, result: LocalResult):
+        """执行学习流程"""
 
-        # 1. 检查是否启用学习
-        if not self.config.get("enabled", True):
-            return
-
-        # 2. 检查预算
+        # 1. 检查预算
         if not self._check_budget():
             return
 
-        # 3. 检查是否有必要
-        if not self._should_learn(result):
-            return
+        try:
+            # 2. 准备脱敏上下文 (使用会话级脱敏器)
+            context = self._prepare_context(user_input, result)
 
-        # 4. 异步学习 (不阻塞主流程)
-        asyncio.create_task(
-            self._learn_from_remote(user_input, result)
-        )
+            # 3. 远程分析
+            feedback = await self.remote.analyze(context)
 
-    def _should_learn(self, result: LocalResult) -> bool:
-        """判断是否值得学习"""
+            # 4. 存储规则
+            if feedback.logic_rule and feedback.confidence > 0.7:
+                await self.rule_manager.add_rule(
+                    rule_type=feedback.rule_type or "general",
+                    logic=feedback.logic_rule,
+                    confidence=feedback.confidence,
+                    example={
+                        "input": context.user_input,
+                        "expected": feedback.better_answer,
+                        "actual": result.answer,
+                        "was_correct": feedback.is_correct
+                    }
+                )
 
-        # 置信度太低
-        if result.confidence < self.config.get("confidence_threshold", 0.9):
-            return True
+            # 5. 更新预算
+            self.hourly_count += 1
+            self.daily_count += 1
 
-        # 检测到歧义
-        if result.ambiguity_detected:
-            return True
-
-        # 实体太多，可能混乱
-        if len(result.entities_found) > 2:
-            return True
-
-        # 有时间表达
-        if result.time_parsed:
-            return True
-
-        return False
+        except Exception as e:
+            # 学习失败不影响主流程
+            print(f"Learning failed: {e}")
 
     def _check_budget(self) -> bool:
         """检查学习预算"""
@@ -617,52 +722,19 @@ class LearningController:
 
         return True
 
-    async def _learn_from_remote(self, user_input: str, result: LocalResult):
-        """从远程学习"""
-
-        try:
-            # 1. 脱敏打包上下文
-            context = self._prepare_context(user_input, result)
-
-            # 2. 远程分析
-            feedback = await self.remote.analyze(context)
-
-            # 3. 存储规则
-            if feedback.logic_rule and feedback.confidence > 0.7:
-                await self.rule_manager.add_rule(
-                    rule_type=feedback.rule_type or "general",
-                    logic=feedback.logic_rule,
-                    confidence=feedback.confidence,
-                    example={
-                        "input": context.user_input,
-                        "expected": feedback.better_answer,
-                        "actual": result.answer,
-                        "was_correct": feedback.is_correct
-                    }
-                )
-
-            # 4. 更新预算
-            self.hourly_count += 1
-            self.daily_count += 1
-
-        except Exception as e:
-            # 学习失败不影响主流程
-            print(f"Learning failed: {e}")
-
     def _prepare_context(self, user_input: str, result: LocalResult) -> SanitizedContext:
-        """准备脱敏上下文"""
+        """准备脱敏上下文 - 使用会话级脱敏器保证一致性"""
 
-        # 脱敏用户输入
-        sanitized = self.sanitizer.sanitize(user_input)
+        # 使用会话级脱敏器 (保证实体映射一致)
+        sanitized = self.session_sanitizer.sanitize(user_input)
 
-        # 获取脱敏后的历史
-        history = self._get_sanitized_history()
+        # 获取脱敏后的历史 (使用相同映射)
+        history = self.session_sanitizer.get_sanitized_history(
+            self._get_recent_history()
+        )
 
         # 获取实体类型 (不含名称)
-        entity_types = [
-            {"type": e.type, "confidence": e.confidence}
-            for e in result.entities_found
-        ]
+        entity_types = self.session_sanitizer.get_entity_types_only()
 
         return SanitizedContext(
             user_input=sanitized.sanitized,
@@ -736,6 +808,37 @@ class ConfidenceEvaluator:
 ```
 
 ## 存储扩展
+
+### 规则格式标准化
+
+规则使用结构化格式，便于小模型理解和应用：
+
+```python
+RULE_TEMPLATE = """
+## 规则: {rule_type}
+触发条件: {trigger_condition}
+处理步骤:
+1. {step_1}
+2. {step_2}
+3. {step_3}
+示例:
+- 输入: {example_input}
+- 输出: {example_output}
+"""
+
+# 示例: 代词消解规则
+rule = """
+## 规则: 代词消解
+触发条件: 用户输入包含"他/她/它/这个/那个"
+处理步骤:
+1. 查找最近5轮对话中提到的人物/事物
+2. 选择最近提到的作为指代对象
+3. 如果有多个候选，选择与当前话题最相关的
+示例:
+- 输入: "张总说下周要开会" → "他说什么了？"
+- 输出: "张总说下周要开会"
+"""
+```
 
 ### 规则在记忆中的存储格式
 
@@ -965,21 +1068,22 @@ class TestRuleManager:
 ## 实现顺序
 
 ### Phase 1: 基础框架 (Day 1)
-1. `server/rule_manager.py` - 规则存储和查询
-2. `server/confidence_evaluator.py` - 置信度评估
-3. 扩展 `memory/memory.py` - 支持 RULE 类型
+1. `server/session_sanitizer.py` - 会话级脱敏器 (保证实体映射一致)
+2. `server/rule_manager.py` - 规则存储和查询
+3. `server/confidence_evaluator.py` - 置信度评估
+4. 扩展 `memory/memory.py` - 支持 RULE 类型
 
 ### Phase 2: 本地处理 (Day 2)
-4. `server/local_processor.py` - 本地模型处理
-5. 集成规则查询到本地处理流程
-6. 测试本地处理
+5. `server/local_processor.py` - 本地模型处理
+6. 集成规则查询到本地处理流程
+7. 测试本地处理
 
 ### Phase 3: 远程学习 (Day 3)
-7. `server/remote_analyzer.py` - 远程分析
-8. `server/learning_controller.py` - 学习控制
-9. 脱敏打包流程
+8. `server/remote_analyzer.py` - 远程分析
+9. `server/learning_controller.py` - 学习控制
+10. 集成 SessionSanitizer 到学习流程
 
 ### Phase 4: 集成测试 (Day 4)
-10. `server/hybrid_agent.py` - 主入口集成
-11. 端到端测试
-12. 性能优化
+11. `server/hybrid_agent.py` - 主入口集成
+12. 端到端测试
+13. 性能优化

@@ -222,5 +222,5 @@ class TestMiniCPMVBackendParseToolCalls:
         assert self.backend.parse_tool_calls("Just a regular response.") == []
 
     def test_default_models_includes_minicpmv(self):
-        assert "minicpm-v-4_6" in DEFAULT_MODELS
-        assert DEFAULT_MODELS["minicpm-v-4_6"]["backend"] == "minicpmv"
+        assert "minicpm-v-4.6" in DEFAULT_MODELS
+        assert DEFAULT_MODELS["minicpm-v-4.6"]["backend"] == "minicpmv"

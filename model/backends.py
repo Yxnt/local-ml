@@ -18,7 +18,7 @@ import os
 import re
 from typing import Any
 
-from server_message_adapter import build_tool_prompt_prefix
+from server_message_adapter import build_tool_prompt_prefix, normalize_messages
 from model.minicpm_tool_parser import parse_mcp_tool_calls
 
 logger = logging.getLogger(__name__)
@@ -36,9 +36,9 @@ DEFAULT_MODELS: dict[str, dict[str, str]] = {
         "backend": "minicpm",
         "model_id": "openbmb/MiniCPM5-1B-MLX",
     },
-    "minicpm-v-4_6": {
+    "minicpm-v-4.6": {
         "backend": "minicpmv",
-        "model_id": "openbmb/MiniCPM-V-4_6",
+        "model_id": "openbmb/MiniCPM-V-4.6",
     },
 }
 
@@ -241,11 +241,12 @@ class GemmaBackend(ModelBackend):
 
     def apply_chat_template(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         tools: list[Any] | None = None,
         enable_thinking: bool = False,  # ignored by Gemma
     ) -> str:
         tokenizer = self._processor.tokenizer
+        messages = normalize_messages(messages)
 
         if tools:
             gemma_tools = _convert_openai_tools_to_gemma(tools)
@@ -335,10 +336,11 @@ class MiniCPMBackend(ModelBackend):
 
     def apply_chat_template(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         tools: list[Any] | None = None,
         enable_thinking: bool = False,
     ) -> str:
+        messages = normalize_messages(messages)
         kwargs: dict[str, Any] = {
             "tokenize": False,
             "add_generation_prompt": True,
@@ -421,11 +423,12 @@ class MiniCPMVBackend(ModelBackend):
 
     def apply_chat_template(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         tools: list[Any] | None = None,
         enable_thinking: bool = False,
     ) -> str:
         tokenizer = self._processor.tokenizer
+        messages = normalize_messages(messages)
 
         if tools:
             # Try native tool template

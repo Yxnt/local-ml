@@ -6,7 +6,6 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional, Literal
 
-from server_message_adapter import normalize_messages
 from model.backends import ModelRegistry
 
 # ====== Pydantic request types (for FastAPI validation) ======
@@ -65,11 +64,9 @@ async def chat_completions(raw_req: Request):
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Model load failed: {e}")
 
-    # Normalize messages and build prompt
-    messages_dict = normalize_messages(messages_raw)
-
+    # Pass raw messages to backend (preserves multimodal content format)
     prompt = backend.apply_chat_template(
-        messages_dict,
+        messages_raw,
         tools=tools,
         enable_thinking=enable_thinking,
     )

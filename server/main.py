@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Literal
 
 from backends import ModelRegistry
+from server.websocket import handle_websocket
 
 # ====== Pydantic request types (for FastAPI validation) ======
 
@@ -29,6 +30,9 @@ default_model = os.environ.get("DEFAULT_MODEL", "gemma-4-e2b-it-4bit")
 # ====== FastAPI ======
 
 app = FastAPI(title="Local ML Service")
+
+# Register WebSocket endpoint
+handle_websocket(app, registry)
 
 
 @app.get("/v1/models")

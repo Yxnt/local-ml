@@ -34,6 +34,23 @@ def embed(req: EmbedRequest):
     return {"embeddings": embeddings.tolist()}
 
 
+class EmbedBatchRequest(BaseModel):
+    texts: list[str]
+    task: str = "retrieval"
+
+
+@app.post("/embed/batch")
+def embed_batch(req: EmbedBatchRequest):
+    """Batch embedding endpoint -- identical logic to /embed but explicit path."""
+    with torch.no_grad():
+        embeddings = model.encode(
+            req.texts,
+            task=req.task,
+            truncate_dim=768,
+        )
+    return {"embeddings": embeddings.tolist()}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}

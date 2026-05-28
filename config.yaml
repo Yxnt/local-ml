@@ -1,0 +1,74 @@
+# Local ML Agent 配置文件
+# 环境变量可以用 ${VAR} 或 ${VAR:default} 格式
+
+# ====== 模型配置 ======
+models:
+  default: minicpm-v-4.6
+  available:
+    minicpm-v-4.6:
+      backend: minicpmv
+      model_id: openbmb/MiniCPM-V-4.6
+      description: "VLM，支持图片，适合 computer use"
+
+    gemma-4-e2b-it-4bit:
+      backend: gemma
+      model_id: mlx-community/gemma-4-e2b-it-4bit
+      description: "Google VLM，通用能力强"
+
+    minicpm5-1b-mlx:
+      backend: minicpm
+      model_id: openbmb/MiniCPM5-1B-MLX
+      description: "轻量模型，速度快"
+
+# ====== Embedding 服务 ======
+embedding:
+  url: http://localhost:8001
+  dimensions: 768
+
+# ====== 集成配置 ======
+integrations:
+  # Obsidian 笔记
+  obsidian:
+    vaults:
+      main: ~/Documents/Obsidian/Main
+      # work: ~/Documents/Obsidian/Work
+
+  # 日历 (CalDAV)
+  calendar:
+    accounts:
+      personal:
+        url: https://caldav.icloud.com
+        username: ${ICLOUD_USERNAME}
+        password: ${ICLOUD_PASSWORD}
+      # work:
+      #   url: https://caldav.google.com
+      #   username: ${GOOGLE_USERNAME}
+      #   password: ${GOOGLE_PASSWORD}
+
+  # 邮件 (IMAP)
+  email:
+    accounts:
+      personal:
+        host: imap.gmail.com
+        username: ${GMAIL_USERNAME}
+        password: ${GMAIL_APP_PASSWORD}
+      # work:
+      #   host: imap.outlook.com
+      #   username: ${OUTLOOK_USERNAME}
+      #   password: ${OUTLOOK_PASSWORD}
+
+  # 智能家居 (占位)
+  smarthome:
+    enabled: false
+
+# ====== 记忆系统 ======
+memory:
+  data_dir: memory/data
+  max_memories: 10000
+
+# ====== 优化配置 ======
+optimization:
+  enabled: true
+  auto_train_threshold: 50
+  min_interactions: 20
+  lm_model: openai/gpt-4o-mini  # 用于 DSPy 优化的模型

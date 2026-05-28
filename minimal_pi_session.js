@@ -71,6 +71,7 @@ export async function createLocalPiSession({
   cwd = process.cwd(),
   systemPrompt = SYSTEM_PROMPT,
   sessionManager = SessionManager.inMemory(cwd),
+  model: modelId = LOCAL_MODEL_ID,
 } = {}) {
   const authStorage = AuthStorage.create();
   const modelRegistry = ModelRegistry.inMemory(authStorage);
@@ -80,8 +81,8 @@ export async function createLocalPiSession({
     apiKey: "dummy",
     models: [
       {
-        id: LOCAL_MODEL_ID,
-        name: "Local Gemma4",
+        id: modelId,
+        name: modelId,
         api: "openai-completions",
         reasoning: false,
         input: ["text"],
@@ -92,9 +93,9 @@ export async function createLocalPiSession({
     ],
   });
 
-  const model = modelRegistry.find("local", LOCAL_MODEL_ID);
+  const model = modelRegistry.find("local", modelId);
   if (!model) {
-    throw new Error(`Model not found: ${LOCAL_MODEL_ID}`);
+    throw new Error(`Model not found: ${modelId}`);
   }
 
   const { session } = await createAgentSession({

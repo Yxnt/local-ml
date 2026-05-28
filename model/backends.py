@@ -14,10 +14,11 @@ import abc
 import asyncio
 import json
 import logging
+import os
 import re
 from typing import Any
 
-from server_message_adapter import build_tool_prompt_prefix, normalize_messages
+from server_message_adapter import build_tool_prompt_prefix
 from model.minicpm_tool_parser import parse_mcp_tool_calls
 
 logger = logging.getLogger(__name__)
@@ -27,14 +28,20 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODELS: dict[str, dict[str, str]] = {
-    "gemma": {
+    "gemma-4-e2b-it-4bit": {
         "backend": "gemma",
         "model_id": "mlx-community/gemma-4-e2b-it-4bit",
     },
-    "minicpm": {
+    "minicpm5-1b-mlx": {
         "backend": "minicpm",
         "model_id": "openbmb/MiniCPM5-1B-MLX",
     },
+}
+
+# Map internal backend names to public API names (matching design spec)
+_BACKEND_DISPLAY_NAMES: dict[str, str] = {
+    "gemma": "mlx_vlm",
+    "minicpm": "mlx_lm",
 }
 
 # Backend name -> class mapping (populated at end of file)
@@ -76,6 +83,7 @@ class ModelBackend(abc.ABC):
         self,
         messages: list[dict[str, str]],
         tools: list[Any] | None = None,
+        enable_thinking: bool = False,
     ) -> str:
         """Convert messages (+ optional tool defs) into a prompt string."""
 
@@ -191,7 +199,6 @@ class GemmaBackend(ModelBackend):
         """Load Gemma 4 via mlx_vlm.  Raises ImportError if mlx_vlm is absent."""
         import mlx.core as mx
         from mlx_vlm import load
-        from mlx_vlm.utils import load_config  # noqa: F401
 
         self._model_id = model_id
         self._model, self._processor = load(model_id)
@@ -231,6 +238,7 @@ class GemmaBackend(ModelBackend):
         self,
         messages: list[dict[str, str]],
         tools: list[Any] | None = None,
+        enable_thinking: bool = False,  # ignored by Gemma
     ) -> str:
         tokenizer = self._processor.tokenizer
 
@@ -262,7 +270,7 @@ class GemmaBackend(ModelBackend):
             tokenize=False,
             add_generation_prompt=True,
         )
-        self.generate(dummy, max_tokens=5)
+        self.generate(dummy, max_tokens=1)
         logger.info("Gemma warmup done")
 
 
@@ -324,11 +332,12 @@ class MiniCPMBackend(ModelBackend):
         self,
         messages: list[dict[str, str]],
         tools: list[Any] | None = None,
+        enable_thinking: bool = False,
     ) -> str:
         kwargs: dict[str, Any] = {
             "tokenize": False,
             "add_generation_prompt": True,
-            "enable_thinking": False,
+            "enable_thinking": enable_thinking,
         }
         if tools:
             kwargs["tools"] = tools
@@ -344,7 +353,7 @@ class MiniCPMBackend(ModelBackend):
             add_generation_prompt=True,
             enable_thinking=False,
         )
-        self.generate(dummy, max_tokens=5)
+        self.generate(dummy, max_tokens=1)
         logger.info("MiniCPM warmup done")
 
 
@@ -371,8 +380,20 @@ class ModelRegistry:
         self._backends[name] = backend
 
     def register_defaults(self) -> None:
-        """Register all entries from DEFAULT_MODELS."""
-        for name, cfg in DEFAULT_MODELS.items():
+        """Register all entries from DEFAULT_MODELS, with optional MODELS_CONFIG override."""
+        models = dict(DEFAULT_MODELS)
+
+        # Override with MODELS_CONFIG env var if set
+        config_env = os.environ.get("MODELS_CONFIG")
+        if config_env:
+            try:
+                override = json.loads(config_env)
+                models.update(override)
+                logger.info("Loaded MODELS_CONFIG override: %s", list(override.keys()))
+            except json.JSONDecodeError as e:
+                logger.warning("Invalid MODELS_CONFIG JSON: %s", e)
+
+        for name, cfg in models.items():
             backend_cls = _BACKEND_CLASSES.get(cfg["backend"])
             if backend_cls is None:
                 raise ValueError(f"Unknown backend type: {cfg['backend']}")
@@ -381,8 +402,14 @@ class ModelRegistry:
             backend._default_model_id = cfg["model_id"]  # type: ignore[attr-defined]
             self.register(name, backend)
 
-    def list_models(self) -> list[str]:
-        return list(self._backends.keys())
+    def list_models(self) -> list[dict[str, str]]:
+        result = []
+        for name in self._backends:
+            cfg = DEFAULT_MODELS.get(name, {})
+            backend_key = cfg.get("backend", "unknown")
+            display_name = _BACKEND_DISPLAY_NAMES.get(backend_key, backend_key)
+            result.append({"id": name, "backend": display_name})
+        return result
 
     def get_backend(self, name: str) -> ModelBackend:
         if name not in self._backends:

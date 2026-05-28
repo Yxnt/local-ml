@@ -25,12 +25,21 @@ class TestModelRegistry:
         registry = ModelRegistry()
         gemma = GemmaBackend()
         minicpm = MiniCPMBackend()
-        registry.register("gemma", gemma)
-        registry.register("minicpm", minicpm)
-        names = registry.list_models()
-        assert "gemma" in names
-        assert "minicpm" in names
-        assert len(names) == 2
+        registry.register("gemma-4-e2b-it-4bit", gemma)
+        registry.register("minicpm5-1b-mlx", minicpm)
+        models = registry.list_models()
+        ids = [m["id"] for m in models]
+        assert "gemma-4-e2b-it-4bit" in ids
+        assert "minicpm5-1b-mlx" in ids
+        assert len(models) == 2
+
+    def test_list_models_backend_display_names(self):
+        registry = ModelRegistry()
+        registry.register_defaults()
+        models = registry.list_models()
+        by_id = {m["id"]: m["backend"] for m in models}
+        assert by_id["gemma-4-e2b-it-4bit"] == "mlx_vlm"
+        assert by_id["minicpm5-1b-mlx"] == "mlx_lm"
 
     def test_unknown_model_raises(self):
         registry = ModelRegistry()
@@ -38,17 +47,18 @@ class TestModelRegistry:
             registry.get_backend("nonexistent")
 
     def test_default_models_populated(self):
-        assert "gemma" in DEFAULT_MODELS
-        assert "minicpm" in DEFAULT_MODELS
-        assert DEFAULT_MODELS["gemma"]["backend"] == "gemma"
-        assert DEFAULT_MODELS["minicpm"]["backend"] == "minicpm"
+        assert "gemma-4-e2b-it-4bit" in DEFAULT_MODELS
+        assert "minicpm5-1b-mlx" in DEFAULT_MODELS
+        assert DEFAULT_MODELS["gemma-4-e2b-it-4bit"]["backend"] == "gemma"
+        assert DEFAULT_MODELS["minicpm5-1b-mlx"]["backend"] == "minicpm"
 
     def test_register_default_models(self):
         registry = ModelRegistry()
         registry.register_defaults()
-        names = registry.list_models()
-        assert "gemma" in names
-        assert "minicpm" in names
+        models = registry.list_models()
+        ids = [m["id"] for m in models]
+        assert "gemma-4-e2b-it-4bit" in ids
+        assert "minicpm5-1b-mlx" in ids
 
 
 # ---------------------------------------------------------------------------

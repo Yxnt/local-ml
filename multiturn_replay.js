@@ -38,7 +38,7 @@ export function buildSecondTurnMessages(initialMessages, toolCall, toolName, too
   ];
 }
 
-async function chat(messages, tools, apiBase = DEFAULT_API_BASE) {
+async function chat(messages, tools, apiBase = DEFAULT_API_BASE, model = LOCAL_MODEL_ID) {
   const response = await fetch(`${apiBase}/chat/completions`, {
     method: "POST",
     headers: {
@@ -46,7 +46,7 @@ async function chat(messages, tools, apiBase = DEFAULT_API_BASE) {
       Authorization: "Bearer dummy",
     },
     body: JSON.stringify({
-      model: LOCAL_MODEL_ID,
+      model,
       messages,
       tools,
       stream: false,

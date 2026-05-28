@@ -182,9 +182,9 @@ class PresidioSanitizer(DataSanitizer):
     def sanitize_with_presidio(self, text: str) -> SanitizedText:
         """使用 Presidio 原生匿名化（更准确）"""
         # 分析
-        analyzer_results = self._detector._analyzer.analyze(
+        analyzer_results = self.detector._analyzer.analyze(
             text=text,
-            language=self._detector._language,
+            language=self.detector._language,
         )
 
         # 使用 Presidio 匿名化
@@ -214,7 +214,7 @@ class PresidioSanitizer(DataSanitizer):
             original=text,
             sanitized=anonymized.text,
             mapping=mapping,
-            level=self._detector.detect(text).level,
+            level=self.detector.detect(text).level,
         )
 
 

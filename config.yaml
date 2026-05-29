@@ -90,3 +90,32 @@ optimization:
   auto_train_threshold: 50
   min_interactions: 20
   lm_model: openai/gpt-4o-mini  # 用于 DSPy 优化的模型
+
+# ====== Hybrid Agent 配置 ======
+hybrid_agent:
+  local:
+    default_model: minicpm-v-4.6
+    max_tokens: 2048
+    temperature: 0.7
+
+  remote:
+    enabled: true
+    model: mimo-v2.5-pro
+    api_key_env: MIMO_API_KEY
+    base_url: https://token-plan-cn.xiaomimimo.com/v1
+    timeout: 30
+
+  learning:
+    enabled: true
+    confidence_threshold: 0.9
+    hourly_limit: 10
+    daily_limit: 100
+    min_remote_confidence: 0.7
+
+  rules:
+    max_rules: 1000
+    expire_days: 90
+    min_success_rate: 0.3
+
+  privacy:
+    sanitize_before_remote: true

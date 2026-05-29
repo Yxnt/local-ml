@@ -45,6 +45,14 @@ class LocalResult:
     needs_remote_help: bool              # 是否需要远程帮助
 
 @dataclass
+class AgentResponse:
+    """Agent 响应"""
+    answer: str                          # 最终回答
+    confidence: float                    # 置信度
+    is_learning: bool                    # 是否正在后台学习
+    learning_task: asyncio.Task | None   # 学习任务 (可用于等待)
+
+@dataclass
 class Entity:
     name: str                            # 实体名称
     type: str                            # person/thing/place/topic
@@ -254,16 +262,50 @@ class HybridAgent:
             config["learning"]
         )
 
-    async def run(self, user_input: str) -> str:
+    async def run(self, user_input: str) -> AgentResponse:
         """主入口: 处理用户输入"""
 
         # 1. 本地处理
         result = await self.local_processor.process(user_input)
 
         # 2. 判断是否需要远程学习
+        learning_task = None
         if result.confidence < 0.9:
-            # 告诉用户正在分析
-            yield "正在分析这个问题..."
+            # 异步学习
+            learning_task = asyncio.create_task(
+                self.learning_controller.learn(user_input, result)
+            )
+
+            # 如果是连续对话，等待学习完成
+            if self._is_followup_question(user_input):
+                await learning_task
+                learning_task = None
+                # 用新规则重新处理
+                result = await self.local_processor.process(user_input)
+
+        # 3. 更新规则统计
+        for rule_id in result.rules_applied:
+            await self.rule_manager.update_rule_stats(rule_id, result)
+
+        # 4. 保存对话到记忆
+        await self._save_conversation(user_input, result.answer)
+
+        return AgentResponse(
+            answer=result.answer,
+            confidence=result.confidence,
+            is_learning=learning_task is not None,
+            learning_task=learning_task
+        )
+
+    async def run_with_progress(self, user_input: str, callback: Callable[[str], None]) -> str:
+        """带进度回调的入口"""
+
+        # 1. 本地处理
+        result = await self.local_processor.process(user_input)
+
+        # 2. 判断是否需要远程学习
+        if result.confidence < 0.9:
+            callback("正在分析这个问题...")
 
             # 异步学习
             learning_task = asyncio.create_task(
@@ -273,7 +315,7 @@ class HybridAgent:
             # 如果是连续对话，等待学习完成
             if self._is_followup_question(user_input):
                 await learning_task
-                # 用新规则重新处理
+                callback("分析完成，正在重新处理...")
                 result = await self.local_processor.process(user_input)
 
         # 3. 更新规则统计
@@ -479,9 +521,8 @@ class LocalProcessor:
 class RemoteAnalyzer:
     """远程 LLM 分析器"""
 
-    def __init__(self, remote_backend, sanitizer):
+    def __init__(self, remote_backend):
         self.remote = remote_backend
-        self.sanitizer = sanitizer
 
     async def analyze(self, context: SanitizedContext) -> RemoteFeedback:
         """分析本地处理结果"""
@@ -952,6 +993,151 @@ def _get_priority(self, rule: LearningRule) -> float:
     return base_priority * effective_rate
 ```
 
+### 规则冲突处理
+
+当同类型有多条规则时，按优先级排序，取最高优先级的规则：
+
+```python
+async def get_relevant_rules(self, context: str) -> list[LearningRule]:
+    """获取相关规则 - 处理冲突"""
+
+    # 1. 提取关键词
+    keywords = self._extract_keywords(context)
+
+    # 2. 搜索规则 (只搜索 active 状态)
+    raw_rules = await self.memory.search(
+        query=" ".join(keywords),
+        memory_type=MemoryType.RULE,
+        metadata_filter={"status": "active"},
+        limit=20
+    )
+
+    # 3. 转换为 LearningRule 对象
+    rules = [self._to_learning_rule(r) for r in raw_rules]
+
+    # 4. 按优先级排序
+    rules.sort(key=lambda r: self._get_priority(r), reverse=True)
+
+    # 5. 去重: 同类型只保留最高优先级的
+    seen_types = set()
+    deduplicated = []
+    for rule in rules:
+        if rule.rule_type not in seen_types:
+            seen_types.add(rule.rule_type)
+            deduplicated.append(rule)
+
+    return deduplicated[:10]  # 最多返回10条
+```
+
+### 规则过期和归档
+
+```python
+class RuleManager:
+    async def cleanup_expired_rules(self):
+        """清理过期规则"""
+        now = datetime.now()
+        expire_days = self.config.get("expire_days", 90)
+
+        # 查找所有规则
+        all_rules = await self.memory.search(
+            query="",
+            memory_type=MemoryType.RULE,
+            limit=1000
+        )
+
+        for rule in all_rules:
+            # 检查是否过期
+            last_used = rule.metadata.get("last_used", rule.created_at)
+            if now - last_used > timedelta(days=expire_days):
+                # 标记为归档
+                rule.metadata["status"] = "archived"
+                await self.memory.update_memory(rule.id, metadata=rule.metadata)
+                logger.info(f"Archived expired rule: {rule.metadata['rule_id']}")
+
+    async def cleanup_low_success_rules(self):
+        """清理低成功率规则"""
+        min_success_rate = self.config.get("min_success_rate", 0.3)
+        min_usage = 5  # 至少使用5次才检查
+
+        all_rules = await self.memory.search(
+            query="",
+            memory_type=MemoryType.RULE,
+            limit=1000
+        )
+
+        for rule in all_rules:
+            usage = rule.metadata.get("usage_count", 0)
+            success = rule.metadata.get("success_count", 0)
+
+            if usage >= min_usage:
+                success_rate = success / usage
+                if success_rate < min_success_rate:
+                    rule.metadata["status"] = "inactive"
+                    await self.memory.update_memory(rule.id, metadata=rule.metadata)
+                    logger.info(f"Deactivated low success rule: {rule.metadata['rule_id']}")
+```
+
+### 并发学习请求处理
+
+```python
+class LearningController:
+    def __init__(self, ...):
+        # ...
+        self._learning_lock = asyncio.Lock()
+        self._pending_learnings: dict[str, asyncio.Task] = {}
+
+    async def learn(self, user_input: str, result: LocalResult):
+        """执行学习流程 - 带并发控制"""
+
+        # 生成学习任务的唯一标识
+        learning_key = self._generate_learning_key(user_input)
+
+        # 检查是否已有相同的学习任务在进行
+        if learning_key in self._pending_learnings:
+            logger.info(f"Skipping duplicate learning: {learning_key}")
+            return
+
+        # 检查预算
+        if not self._check_budget():
+            return
+
+        # 标记学习任务开始
+        self._pending_learnings[learning_key] = asyncio.current_task()
+
+        try:
+            async with self._learning_lock:
+                # 准备脱敏上下文
+                context = self._prepare_context(user_input, result)
+
+                # 远程分析
+                feedback = await self.remote.analyze(context)
+
+                # 存储规则
+                if feedback.logic_rule and feedback.confidence > 0.7:
+                    await self.rule_manager.add_rule(
+                        rule_type=feedback.rule_type or "general",
+                        logic=feedback.logic_rule,
+                        confidence=feedback.confidence,
+                        example={...}
+                    )
+
+                # 更新预算
+                self.hourly_count += 1
+                self.daily_count += 1
+
+        except Exception as e:
+            logger.error(f"Learning failed: {e}")
+
+        finally:
+            # 移除学习任务标记
+            self._pending_learnings.pop(learning_key, None)
+
+    def _generate_learning_key(self, user_input: str) -> str:
+        """生成学习任务的唯一标识"""
+        # 使用输入的前50个字符作为标识
+        return hashlib.md5(user_input[:50].encode()).hexdigest()
+```
+
 ## 存储扩展
 
 ### 规则格式标准化
@@ -1140,6 +1326,66 @@ hybrid_agent:
 
 ## 测试用例
 
+### test_session_sanitizer.py
+
+```python
+class TestSessionSanitizer:
+    """会话级脱敏器测试"""
+
+    def test_consistent_entity_mapping(self):
+        """同一实体多次出现，映射一致"""
+        sanitizer = SessionSanitizer()
+
+        result1 = sanitizer.sanitize("张总说下周要开会")
+        result2 = sanitizer.sanitize("张总要项目报告")
+
+        # 两次脱敏，张总应该映射到同一个占位符
+        assert "[PERSON_0]" in result1.sanitized
+        assert "[PERSON_0]" in result2.sanitized
+        assert result1.mapping["[PERSON_0]"] == result2.mapping["[PERSON_0]"]
+
+    def test_multiple_entities(self):
+        """多个实体，不同占位符"""
+        sanitizer = SessionSanitizer()
+
+        result = sanitizer.sanitize("张总和王总都来了")
+        assert "[PERSON_0]" in result.sanitized
+        assert "[PERSON_1]" in result.sanitized
+        assert result.mapping["[PERSON_0]"] != result.mapping["[PERSON_1]"]
+
+    def test_desanitize(self):
+        """还原占位符"""
+        sanitizer = SessionSanitizer()
+
+        sanitized = sanitizer.sanitize("张总的邮箱是zhang@test.com")
+        restored = sanitizer.desanitize(sanitized.sanitized)
+
+        assert "张总" in restored
+        assert "zhang@test.com" in restored
+
+    def test_get_sanitized_history(self):
+        """历史脱敏一致性"""
+        sanitizer = SessionSanitizer()
+
+        # 先脱敏当前输入
+        sanitizer.sanitize("张总说下周要开会")
+
+        # 脱敏历史
+        history = ["张总昨天说要项目报告"]
+        sanitized_history = sanitizer.get_sanitized_history(history)
+
+        # 历史中的张总应该映射到同一个占位符
+        assert "[PERSON_0]" in sanitized_history[0]
+
+    def test_structured_data_sanitization(self):
+        """结构化数据脱敏"""
+        sanitizer = SessionSanitizer()
+
+        result = sanitizer.sanitize("邮箱是test@example.com，电话13800138000")
+        assert "[EMAIL_0]" in result.sanitized
+        assert "[PHONE_0]" in result.sanitized
+```
+
 ### test_hybrid_agent.py
 
 ```python
@@ -1150,8 +1396,8 @@ class TestHybridAgent:
         """简单查询不需要远程学习"""
         agent = HybridAgent(test_config)
         result = await agent.run("今天天气怎么样")
-        assert result  # 有回答
-        # 不应该触发远程学习 (无代词、无时间)
+        assert result.answer
+        assert not result.is_learning  # 不应该触发远程学习
 
     async def test_pronoun_triggers_learning(self):
         """代词查询触发远程学习"""
@@ -1160,15 +1406,30 @@ class TestHybridAgent:
         await agent.run("张总说下周要开会")
         # 这个应该触发学习
         result = await agent.run("他说什么了")
-        assert result
+        assert result.answer
+        # 如果置信度低，应该正在学习
+        # assert result.is_learning  # 可能触发也可能不触发
 
     async def test_privacy_preserved(self):
         """确保隐私保护"""
         agent = HybridAgent(test_config)
         # 包含敏感信息
         result = await agent.run("张总的邮箱是zhang@test.com")
-        # 验证远程收到的是脱敏后的数据
-        # ...
+        assert result.answer
+        # 验证远程收到的是脱敏后的数据 (需要 mock)
+
+    async def test_run_with_progress(self):
+        """带进度回调的测试"""
+        agent = HybridAgent(test_config)
+        progress_messages = []
+
+        def callback(msg):
+            progress_messages.append(msg)
+
+        result = await agent.run_with_progress("他说什么了", callback)
+        assert result
+        # 如果触发学习，应该有进度消息
+        # assert len(progress_messages) > 0
 ```
 
 ### test_rule_manager.py
@@ -1202,6 +1463,104 @@ class TestRuleManager:
 
         rules = await manager.get_relevant_rules("代词")
         assert rules[0].confidence > rules[1].confidence
+
+    async def test_dynamic_rule_types(self):
+        """动态规则类型测试"""
+        manager = RuleManager(test_memory)
+
+        # 添加自定义类型规则
+        rule = await manager.add_rule(
+            rule_type="location_query",
+            logic="当用户提到'和XX吃饭/开会'时，搜索相关地点",
+            confidence=0.8,
+            source="remote_feedback"
+        )
+        assert rule.rule_type == "location_query"
+
+    async def test_rule_conflict_resolution(self):
+        """规则冲突解决测试"""
+        manager = RuleManager(test_memory)
+
+        # 添加两条同类型规则
+        await manager.add_rule("pronoun_resolution", "规则A", 0.9, source="remote_feedback")
+        await manager.add_rule("pronoun_resolution", "规则B", 0.7, source="local_pattern")
+
+        rules = await manager.get_relevant_rules("代词")
+        # 高优先级的应该排在前面
+        assert rules[0].confidence >= rules[1].confidence
+
+    async def test_rule_deactivation(self):
+        """规则失效测试"""
+        manager = RuleManager(test_memory)
+
+        # 添加规则
+        rule = await manager.add_rule(
+            rule_type="test_rule",
+            logic="测试规则",
+            confidence=0.8
+        )
+
+        # 模拟多次失败
+        for _ in range(10):
+            result = LocalResult(confidence=0.3, ...)
+            await manager.update_rule_stats(rule.id, result)
+
+        # 规则应该被标记为失效
+        rules = await manager.search_rules(rule.id)
+        assert rules[0].metadata["status"] == "inactive"
+```
+
+### test_local_pattern_discovery.py
+
+```python
+class TestLocalPatternDiscovery:
+    """本地模式发现测试"""
+
+    async def test_pronoun_pattern_extraction(self):
+        """代词模式提取"""
+        processor = LocalProcessor(test_model, test_memory, test_rule_manager)
+
+        result = LocalResult(
+            answer="张总说的是项目报告",
+            confidence=0.95,
+            pronouns_resolved={"[PERSON_0]": "张总"},
+            ...
+        )
+
+        pattern = processor._extract_success_pattern("他说什么了", result)
+        assert pattern is not None
+        assert pattern["type"] == "pronoun_resolution"
+
+    async def test_time_pattern_extraction(self):
+        """时间模式提取"""
+        processor = LocalProcessor(test_model, test_memory, test_rule_manager)
+
+        result = LocalResult(
+            answer="上周的会议记录",
+            confidence=0.95,
+            time_parsed=TimeRange(...),
+            ...
+        )
+
+        pattern = processor._extract_success_pattern("上周开了什么会", result)
+        assert pattern is not None
+        assert pattern["type"] == "time_parsing"
+
+    async def test_no_pattern_for_simple_query(self):
+        """简单查询不提取模式"""
+        processor = LocalProcessor(test_model, test_memory, test_rule_manager)
+
+        result = LocalResult(
+            answer="今天天气不错",
+            confidence=0.95,
+            pronouns_resolved={},
+            time_parsed=None,
+            entities_found=[],
+            ...
+        )
+
+        pattern = processor._extract_success_pattern("今天天气怎么样", result)
+        assert pattern is None  # 没有代词、时间、实体，不提取模式
 ```
 
 ## 实现顺序

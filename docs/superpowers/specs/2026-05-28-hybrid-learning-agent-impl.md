@@ -343,7 +343,7 @@ class LocalProcessor:
             memories=memories
         )
 
-        return LocalResult(
+        result = LocalResult(
             answer=parsed["answer"],
             confidence=confidence,
             reasoning=parsed["reasoning"],
@@ -354,6 +354,54 @@ class LocalProcessor:
             ambiguity_detected=parsed["has_ambiguity"],
             needs_remote_help=confidence < 0.9
         )
+
+        # 8. 如果成功，提取本地模式
+        if confidence > 0.9:
+            await self._extract_and_store_pattern(user_input, result)
+
+        return result
+
+    async def _extract_and_store_pattern(self, user_input: str, result: LocalResult):
+        """从成功案例中提取模式并存储"""
+
+        pattern = self._extract_success_pattern(user_input, result)
+        if pattern:
+            await self.rule_manager.add_rule(
+                rule_type=pattern["type"],
+                logic=pattern["logic"],
+                confidence=0.7,  # 本地发现的规则置信度较低
+                source="local_pattern",
+                example={
+                    "input": user_input,
+                    "output": result.answer
+                }
+            )
+
+    def _extract_success_pattern(self, user_input: str, result: LocalResult) -> dict | None:
+        """从成功案例中提取模式"""
+
+        # 检查是否有代词解析
+        if result.pronouns_resolved:
+            return {
+                "type": "pronoun_resolution",
+                "logic": "当用户输入包含代词时，查找最近提到的实体"
+            }
+
+        # 检查是否有时间解析
+        if result.time_parsed:
+            return {
+                "type": "time_parsing",
+                "logic": "当用户输入包含时间表达时，转换为具体日期范围"
+            }
+
+        # 检查是否有实体匹配
+        if len(result.entities_found) > 0:
+            return {
+                "type": "entity_matching",
+                "logic": "当用户输入包含实体时，从记忆中查找相关信息"
+            }
+
+        return None
 
     def _build_prompt(
         self,
@@ -563,22 +611,23 @@ class RuleManager:
         rule_type: str,  # 不限制类型，远程 LLM 可以定义任何类型
         logic: str,
         confidence: float,
+        source: str = "remote_feedback",  # 来源: remote_feedback/local_pattern/user_taught
         example: dict | None = None
     ) -> LearningRule:
         """添加新规则 - 接受任何规则类型"""
 
         # 不检查 rule_type 是否在预定义列表中
-        # 远程 LLM 可以创建任何新类型
+        # 远程 LLM 或本地可以创建任何新类型
 
         rule_id = f"rule_{uuid.uuid4().hex[:8]}"
 
         rule_data = {
             "rule_id": rule_id,
-            "rule_type": rule_type,  # 直接使用远程返回的类型
+            "rule_type": rule_type,
             "pattern": self._extract_pattern(logic),
             "logic": logic,
             "confidence": confidence,
-            "source": "remote_feedback",
+            "source": source,
             "usage_count": 0,
             "success_count": 0,
             "examples": [example] if example else [],
@@ -816,6 +865,91 @@ class ConfidenceEvaluator:
         # 加权平均
         total_score = sum(score * weight for _, score, weight in scores)
         return min(max(total_score, 0.0), 1.0)
+```
+
+## 学习机制
+
+### 双向学习
+
+系统支持两种学习来源：
+
+| 来源 | 触发条件 | 置信度 | 说明 |
+|------|---------|--------|------|
+| `remote_feedback` | 本地失败 (置信度 < 0.9) | 0.8-1.0 | 远程分析，质量高 |
+| `local_pattern` | 本地成功 (置信度 > 0.9) | 0.6-0.7 | 本地发现，质量中 |
+| `user_taught` | 用户教导 | 1.0 | 用户明确，质量最高 |
+
+### 本地模式发现
+
+当本地模型成功处理复杂查询时，自动提取成功模式：
+
+```python
+async def _extract_and_store_pattern(self, user_input: str, result: LocalResult):
+    """从成功案例中提取模式并存储"""
+
+    pattern = self._extract_success_pattern(user_input, result)
+    if pattern:
+        await self.rule_manager.add_rule(
+            rule_type=pattern["type"],
+            logic=pattern["logic"],
+            confidence=0.7,  # 本地发现的规则置信度较低
+            source="local_pattern",
+            example={
+                "input": user_input,
+                "output": result.answer
+            }
+        )
+
+def _extract_success_pattern(self, user_input: str, result: LocalResult) -> dict | None:
+    """从成功案例中提取模式"""
+
+    # 检查是否有代词解析
+    if result.pronouns_resolved:
+        return {
+            "type": "pronoun_resolution",
+            "logic": "当用户输入包含代词时，查找最近提到的实体"
+        }
+
+    # 检查是否有时间解析
+    if result.time_parsed:
+        return {
+            "type": "time_parsing",
+            "logic": "当用户输入包含时间表达时，转换为具体日期范围"
+        }
+
+    # 检查是否有实体匹配
+    if len(result.entities_found) > 0:
+        return {
+            "type": "entity_matching",
+            "logic": "当用户输入包含实体时，从记忆中查找相关信息"
+        }
+
+    return None
+```
+
+### 规则优先级
+
+```python
+def _get_priority(self, rule: LearningRule) -> float:
+    """计算规则优先级 - 成功率 + 使用次数加权"""
+    base_priority = {
+        "user_taught": 100,      # 用户教导，最高优先级
+        "remote_feedback": 80,   # 远程反馈，高优先级
+        "local_pattern": 60,     # 本地发现，中优先级
+    }.get(rule.source, 40)
+
+    # 未测试的规则打折
+    if rule.usage_count == 0:
+        return base_priority * 0.6
+
+    # 使用次数越多，越信任成功率
+    trust = min(rule.usage_count / 10, 1.0)  # 用10次就完全信任
+    success_rate = rule.success_count / rule.usage_count
+
+    # 加权成功率
+    effective_rate = success_rate * trust + 0.5 * (1 - trust)
+
+    return base_priority * effective_rate
 ```
 
 ## 存储扩展

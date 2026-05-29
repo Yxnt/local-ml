@@ -112,14 +112,18 @@ class RuleExample:
     actual_output: str | None            # 实际输出
     was_correct: bool                    # 是否正确
 
-# 规则类型枚举
-class RuleType(str, Enum):
-    PRONOUN_RESOLUTION = "pronoun_resolution"    # 代词消解
-    TIME_PARSING = "time_parsing"                # 时间解析
-    ENTITY_MATCHING = "entity_matching"          # 实体匹配
-    INTENT_RECOGNITION = "intent_recognition"    # 意图识别
-    DISAMBIGUATION = "disambiguation"            # 歧义处理
-    CONTEXT_INFERENCE = "context_inference"      # 上下文推断
+# 规则类型 - 不限制，远程 LLM 可以定义任何类型
+# 常见类型示例 (仅供参考，不是枚举限制):
+# - pronoun_resolution: 代词消解
+# - time_parsing: 时间解析
+# - entity_matching: 实体匹配
+# - intent_recognition: 意图识别
+# - location_query: 地点查询
+# - preference_lookup: 偏好查找
+# - schedule_check: 日程查询
+# - comparison: 比较
+# - email_compose: 邮件撰写
+# - 任何远程 LLM 认为合适的类型
 ```
 
 ### 4. SanitizedContext (脱敏上下文)
@@ -478,7 +482,7 @@ class RemoteAnalyzer:
   "reasoning": "详细分析",
   "better_answer": "如果本地错了，正确答案是什么",
   "logic_rule": "可以学习的通用规则 (用自然语言描述)",
-  "rule_type": "pronoun_resolution/time_parsing/entity_matching/...",
+  "rule_type": "你认为这个规则属于什么类型 (可以是任何类型)",
   "corrections": [
     {{
       "field": "pronoun/time/entity",
@@ -492,7 +496,10 @@ class RemoteAnalyzer:
 注意:
 - 只基于提供的脱敏数据分析，不要假设未提供的信息
 - 规则要通用化，不要针对具体实体
-- 如果信息不足以判断，说明需要什么额外信息"""
+- 如果信息不足以判断，说明需要什么额外信息
+- rule_type 可以是任何你认为合适的类型，不限于预定义的类型
+  例如: "location_query", "preference_lookup", "schedule_check", "comparison", "email_compose" 等
+- 鼓励发现新的模式和规则类型"""
 
     def _parse_feedback(self, response: str) -> RemoteFeedback:
         """解析远程反馈"""
@@ -553,18 +560,21 @@ class RuleManager:
 
     async def add_rule(
         self,
-        rule_type: str,
+        rule_type: str,  # 不限制类型，远程 LLM 可以定义任何类型
         logic: str,
         confidence: float,
         example: dict | None = None
     ) -> LearningRule:
-        """添加新规则"""
+        """添加新规则 - 接受任何规则类型"""
+
+        # 不检查 rule_type 是否在预定义列表中
+        # 远程 LLM 可以创建任何新类型
 
         rule_id = f"rule_{uuid.uuid4().hex[:8]}"
 
         rule_data = {
             "rule_id": rule_id,
-            "rule_type": rule_type,
+            "rule_type": rule_type,  # 直接使用远程返回的类型
             "pattern": self._extract_pattern(logic),
             "logic": logic,
             "confidence": confidence,
@@ -572,6 +582,7 @@ class RuleManager:
             "usage_count": 0,
             "success_count": 0,
             "examples": [example] if example else [],
+            "status": "active",
         }
 
         await self.memory.remember(
@@ -857,20 +868,14 @@ RULE_METADATA_SCHEMA = {
     "type": "object",
     "properties": {
         "rule_id": {"type": "string"},
-        "rule_type": {"type": "string", "enum": [
-            "pronoun_resolution",
-            "time_parsing",
-            "entity_matching",
-            "intent_recognition",
-            "disambiguation",
-            "context_inference"
-        ]},
+        "rule_type": {"type": "string"},  # 不限制类型，远程 LLM 可以定义任何类型
         "pattern": {"type": "string"},
         "logic": {"type": "string"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "source": {"type": "string"},
         "usage_count": {"type": "integer"},
         "success_count": {"type": "integer"},
+        "status": {"type": "string", "enum": ["active", "inactive", "archived"]},
         "examples": {
             "type": "array",
             "items": {

@@ -24,6 +24,7 @@ class MemoryType(str, Enum):
     PREFERENCE = "preference"
     EXPERIENCE = "experience"
     CONVERSATION = "conversation"
+    RULE = "rule"
 
 
 @dataclass

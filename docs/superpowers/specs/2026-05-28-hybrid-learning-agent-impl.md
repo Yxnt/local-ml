@@ -1,5 +1,9 @@
 # Hybrid Learning Agent - Implementation Details
 
+## 概述
+
+HybridAgent 是一个混合学习 Agent，结合本地模型实时处理和远程模型异步学习。它继承现有 Agent 的工具调用能力，并增加学习机制。
+
 ## 文件结构
 
 ```
@@ -23,6 +27,56 @@ tests/
 ├── test_learning_controller.py
 └── test_session_sanitizer.py
 ```
+
+## 与现有系统的关系
+
+### 继承现有 Agent 的能力
+
+HybridAgent 继承现有 Agent 的以下能力：
+- 工具分发（Obsidian、Calendar、Email、SmartHome、Computer Use）
+- 记忆系统集成（soul、user、memory）
+- WebSocket 支持
+
+### 新增能力
+
+HybridAgent 新增以下能力：
+- 双向学习（远程反馈 + 本地模式发现）
+- 规则管理（动态规则类型、优先级、生命周期）
+- 会话级脱敏（保证隐私）
+- 置信度评估（决定是否需要远程帮助）
+
+### 工具调用流程
+
+```
+用户输入
+    ↓
+本地处理 (LocalProcessor)
+    ↓
+模型返回工具调用?
+    ├─ 是 → 执行工具 (调用现有集成)
+    │        ↓
+    │        用工具结果继续处理
+    │        ↓
+    │        评估置信度
+    └─ 否 → 直接评估置信度
+    ↓
+置信度 < 0.9?
+    ├─ 是 → 远程学习
+    └─ 否 → 本地模式发现
+    ↓
+返回结果
+```
+
+### 集成点
+
+| 集成 | 调用方式 | 说明 |
+|------|---------|------|
+| Obsidian | `obsidian_search()`, `obsidian_read()` | 笔记搜索和读取 |
+| Calendar | `calendar_search()`, `calendar_upcoming()` | 日程查询 |
+| Email | `email_search()`, `email_recent()` | 邮件搜索 |
+| SmartHome | `smart_home_list_devices()`, `smart_home_control()` | 智能家居控制 |
+| Computer Use | `computer_action()` | 屏幕控制 |
+| Memory | `memory_remember()`, `memory_recall()` | 记忆管理 |
 
 ## 数据结构定义
 

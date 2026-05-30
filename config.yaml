@@ -79,6 +79,15 @@ integrations:
   smarthome:
     enabled: false
 
+  # Apple Photos
+  photos:
+    enabled: true
+    photos_library: ~/Pictures/Photos Library.photoslibrary
+    db_path: memory/photos.db
+    vlm_model: minicpm-v-4.6
+    cache_analyses: true
+    max_results: 20
+
 # ====== 记忆系统 ======
 memory:
   data_dir: memory/data

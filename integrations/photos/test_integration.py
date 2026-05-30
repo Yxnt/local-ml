@@ -6,7 +6,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from integrations.base import IntegrationConfig
 from integrations.photos.indexer import PhotosIndexer
+from integrations.photos.integration import PhotosIntegration
 from integrations.photos.tools import get_photos_tools
 from integrations.photos.vlm_analyzer import VLMAnalyzer
 
@@ -231,3 +233,26 @@ class TestPhotosTools:
         assert "question" in props
         assert props["question"]["type"] == "string"
         assert params["required"] == ["photo_id"]
+
+
+class TestPhotosIntegration:
+    """Test suite for PhotosIntegration."""
+
+    def test_get_tools(self):
+        """get_tools() should return exactly 3 tools."""
+        config = IntegrationConfig(name="photos")
+        integration = PhotosIntegration(config)
+        tools = integration.get_tools()
+
+        assert len(tools) == 3
+        names = {t["function"]["name"] for t in tools}
+        assert names == {"photos_search", "photos_list_albums", "photos_describe"}
+
+    @pytest.mark.asyncio
+    async def test_connect_without_library(self):
+        """connect() should raise ValueError when photos_library is missing."""
+        config = IntegrationConfig(name="photos", config={})
+        integration = PhotosIntegration(config)
+
+        with pytest.raises(ValueError, match="photos_library not configured"):
+            await integration.connect()

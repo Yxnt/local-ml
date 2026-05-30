@@ -1,11 +1,13 @@
-"""Tests for Apple Photos indexer."""
+"""Tests for Apple Photos integration."""
 
 import sqlite3
 from datetime import datetime
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from integrations.photos.indexer import PhotosIndexer
+from integrations.photos.vlm_analyzer import VLMAnalyzer
 
 
 @pytest.fixture
@@ -119,3 +121,50 @@ class TestPhotosIndexer:
         assert len(results) == 2
         uuids = {r["uuid"] for r in results}
         assert uuids == {"t1", "t3"}
+
+
+@pytest.fixture
+def analyzer(tmp_path):
+    """Create a VLMAnalyzer with a temporary database."""
+    db_path = str(tmp_path / "photos.db")
+    analyzer = VLMAnalyzer(model_name="test-model", db_path=db_path)
+    analyzer.init_db()
+    yield analyzer
+    analyzer.close()
+
+
+def _seed_photo(conn, uuid="photo-001"):
+    """Insert a minimal photo record so FK references work."""
+    conn.execute(
+        "INSERT OR IGNORE INTO photos (uuid, original_filename) VALUES (?, ?)",
+        (uuid, f"{uuid}.jpg"),
+    )
+    conn.commit()
+
+
+class TestVLMAnalyzer:
+    """Test suite for VLMAnalyzer caching logic."""
+
+    def test_cache_and_retrieve(self, analyzer):
+        """_cache_result() should persist; _get_cached() should retrieve."""
+        _seed_photo(analyzer._conn, "photo-001")
+
+        analyzer._cache_result("photo-001", "What is this?", "A sunset photo")
+
+        result = analyzer._get_cached("photo-001", "What is this?")
+        assert result == "A sunset photo"
+
+    def test_cache_different_questions(self, analyzer):
+        """Different questions for the same photo should be cached separately."""
+        _seed_photo(analyzer._conn, "photo-002")
+
+        analyzer._cache_result("photo-002", "What is this?", "A sunset photo")
+        analyzer._cache_result("photo-002", "What colors?", "Orange and purple")
+
+        assert analyzer._get_cached("photo-002", "What is this?") == "A sunset photo"
+        assert analyzer._get_cached("photo-002", "What colors?") == "Orange and purple"
+
+    def test_cache_miss(self, analyzer):
+        """_get_cached() should return None when no cache entry exists."""
+        result = analyzer._get_cached("nonexistent", "What is this?")
+        assert result is None

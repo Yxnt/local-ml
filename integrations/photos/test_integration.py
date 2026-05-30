@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from integrations.photos.indexer import PhotosIndexer
+from integrations.photos.tools import get_photos_tools
 from integrations.photos.vlm_analyzer import VLMAnalyzer
 
 
@@ -168,3 +169,65 @@ class TestVLMAnalyzer:
         """_get_cached() should return None when no cache entry exists."""
         result = analyzer._get_cached("nonexistent", "What is this?")
         assert result is None
+
+
+class TestPhotosTools:
+    """Test suite for Photos tool definitions."""
+
+    def test_tools_count(self):
+        """get_photos_tools() should return exactly 3 tools."""
+        tools = get_photos_tools()
+        assert len(tools) == 3
+
+    def test_search_tool(self):
+        """photos_search should have the correct schema."""
+        tools = get_photos_tools()
+        search = next(t for t in tools if t["function"]["name"] == "photos_search")
+
+        assert search["type"] == "function"
+        params = search["function"]["parameters"]
+        assert params["type"] == "object"
+
+        props = params["properties"]
+        assert "query" in props
+        assert props["query"]["type"] == "string"
+        assert "date_from" in props
+        assert props["date_from"]["type"] == "string"
+        assert "date_to" in props
+        assert props["date_to"]["type"] == "string"
+        assert "album" in props
+        assert props["album"]["type"] == "string"
+        assert "limit" in props
+        assert props["limit"]["type"] == "integer"
+        assert params["required"] == []
+
+    def test_list_albums_tool(self):
+        """photos_list_albums should have the correct schema."""
+        tools = get_photos_tools()
+        list_albums = next(
+            t for t in tools if t["function"]["name"] == "photos_list_albums"
+        )
+
+        assert list_albums["type"] == "function"
+        params = list_albums["function"]["parameters"]
+        assert params["type"] == "object"
+        assert params["properties"] == {}
+        assert params["required"] == []
+
+    def test_describe_tool(self):
+        """photos_describe should have the correct schema with required photo_id."""
+        tools = get_photos_tools()
+        describe = next(
+            t for t in tools if t["function"]["name"] == "photos_describe"
+        )
+
+        assert describe["type"] == "function"
+        params = describe["function"]["parameters"]
+        assert params["type"] == "object"
+
+        props = params["properties"]
+        assert "photo_id" in props
+        assert props["photo_id"]["type"] == "string"
+        assert "question" in props
+        assert props["question"]["type"] == "string"
+        assert params["required"] == ["photo_id"]

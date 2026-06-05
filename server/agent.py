@@ -10,8 +10,18 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import sys
 import uuid
 from typing import Any
+
+# Ensure project root is on sys.path before any imports of sibling packages.
+import pathlib
+_PROJECT_ROOT = str(pathlib.Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+    # Force optimization to be importable
+    import optimization.collector  # noqa: F401
 
 from backends.registry import ModelRegistry
 from memory.manager import MemoryManager

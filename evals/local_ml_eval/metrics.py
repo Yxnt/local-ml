@@ -45,6 +45,25 @@ def compute_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def placeholder_metrics(total_tasks: int) -> dict[str, Any]:
+    """Return placeholder metrics for dry-run output.
+
+    Dry-run validates task structure only, so execution metrics should remain
+    explicitly unset instead of looking like genuine zero scores.
+    """
+    return {
+        "total_tasks": total_tasks,
+        "task_success_rate": None,
+        "expected_tool_hit_rate": None,
+        "forbidden_tool_call_rate": None,
+        "tool_failure_rate": None,
+        "tool_request_rate": None,
+        "generated_tool_success_rate": None,
+        "egl": None,
+        "avg_latency_ms": None,
+    }
+
+
 def _compute_egl(results: list[dict[str, Any]]) -> float | None:
     """EGL = generated tools successfully used / total tool invocations."""
     tool_invocations = sum(

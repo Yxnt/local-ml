@@ -5,7 +5,7 @@ Minimal evaluation harness for local-ml tool evolution.
 ## Quick start
 
 ```bash
-# Dry-run (validate tasks, output skeleton report)
+# Dry-run (validate tasks, output skeleton report with placeholder metrics)
 python -m evals.local_ml_eval.runner \
   --tasks evals/local_ml_eval/tasks.jsonl \
   --output /tmp/local_ml_eval_report.json \
@@ -14,6 +14,20 @@ python -m evals.local_ml_eval.runner \
 # View report
 cat /tmp/local_ml_eval_report.json
 ```
+
+```bash
+# Live execution (real Agent.run path, offline fixture integrations by default)
+python -m evals.local_ml_eval.runner \
+  --tasks evals/local_ml_eval/tasks.jsonl \
+  --output /tmp/local_ml_eval_report.json \
+  --markdown /tmp/local_ml_eval_report.md \
+  --model gemma-4-e2b-it-4bit
+```
+
+Live mode runs through the real `Agent.run -> ToolRegistry -> ToolRuntimeRouter ->
+Telemetry` flow. By default it connects offline fixture integrations for
+Obsidian / Calendar / Email and pre-registers generated tool fixtures so the
+harness can execute end-to-end without external accounts.
 
 ## Task format (JSONL)
 
@@ -50,3 +64,10 @@ Fields:
 | generated_tool_success_rate | Fraction of generated tools that executed successfully |
 | egl | Generated tools used / total tool invocations |
 | avg_latency_ms | Average task latency |
+
+## Modes
+
+- `--dry-run`: validate task structure only; metrics are placeholders (`null`)
+- default live mode: execute tasks through `Agent.run`
+- `--integration-fixtures none`: do not connect offline fixture integrations
+- `--no-generated-tool-fixtures`: do not pre-register generated eval tools

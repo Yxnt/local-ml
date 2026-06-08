@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
-import tempfile
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
+
+from backends.base import ModelBackend
 
 
 TASKS_PATH = "evals/local_ml_eval/tasks.jsonl"
@@ -90,6 +92,20 @@ class TestDryRun:
         ]
         for field in required_fields:
             assert field in metrics, f"Missing metric: {field}"
+
+    def test_dry_run_metrics_are_placeholders(self):
+        """Dry-run metrics should not look like real execution metrics."""
+        from evals.local_ml_eval.runner import load_tasks, run_dry
+
+        tasks = load_tasks(TASKS_PATH)
+        result = run_dry(tasks)
+        metrics = result["metrics"]
+
+        assert metrics["total_tasks"] == len(result["results"])
+        assert metrics["task_success_rate"] is None
+        assert metrics["expected_tool_hit_rate"] is None
+        assert metrics["tool_request_rate"] is None
+        assert metrics["avg_latency_ms"] is None
 
     def test_dry_run_results_have_all_fields(self):
         """Each result should have all required fields."""
@@ -176,3 +192,117 @@ class TestReport:
         content = Path(output).read_text()
         assert "# local_ml_eval Report" in content
         assert "0.85" in content
+
+
+class ScriptedEvalBackend(ModelBackend):
+    """Deterministic backend that emits tool calls based on the latest user input."""
+
+    def __init__(self) -> None:
+        self._messages: list[dict] = []
+
+    def load(self, model_id: str) -> None:
+        pass
+
+    def unload(self) -> None:
+        pass
+
+    def generate(self, prompt: str, max_tokens: int = 2048, temperature: float = 0.7, top_p: float = 0.9) -> str:
+        if self._messages and self._messages[-1].get("role") == "tool":
+            return "done"
+
+        user_input = next(
+            (m.get("content", "") for m in reversed(self._messages) if m.get("role") == "user"),
+            "",
+        )
+        mapping = {
+            "记住我喜欢简洁回答": ("memory_remember", {"content": "我喜欢简洁回答", "type": "fact", "importance": 0.8}),
+            "搜索Obsidian笔记中关于机器学习的内容": ("obsidian_search", {"query": "机器学习", "limit": 3}),
+            "解析这个ICS日历文件": ("parse_ics_calendar", {"text": "BEGIN:VCALENDAR"}),
+            "统计这段文本的单词数": ("text_count_words", {"text": "one two three four"}),
+        }
+        for needle, (name, arguments) in mapping.items():
+            if needle in user_input:
+                return json.dumps({"name": name, "arguments": arguments}, ensure_ascii=False)
+        return "No tool needed"
+
+    def apply_chat_template(self, messages, tools=None, enable_thinking=False) -> str:
+        self._messages = list(messages)
+        return "prompt"
+
+    def parse_tool_calls(self, text: str) -> list[dict]:
+        try:
+            obj = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return []
+
+        if "name" not in obj:
+            return []
+
+        return [{
+            "id": "call_0",
+            "type": "function",
+            "function": {
+                "name": obj["name"],
+                "arguments": json.dumps(obj.get("arguments", {}), ensure_ascii=False),
+            },
+        }]
+
+    def warmup(self) -> None:
+        pass
+
+
+def _make_eval_agent(tmp_path: Path):
+    """Create an Agent wired to the deterministic eval backend."""
+    with patch("server.agent.ModelRegistry") as MockRegistry, patch("server.agent.EmbeddingClient") as MockEmbedding:
+        mock_registry = MockRegistry.return_value
+        backend = ScriptedEvalBackend()
+        mock_registry.register_defaults.return_value = None
+        mock_registry.get_backend.return_value = backend
+        mock_registry.get_or_load = AsyncMock(return_value=backend)
+        mock_registry.list_models.return_value = []
+
+        mock_embedding = MockEmbedding.return_value
+        mock_embedding.close = AsyncMock()
+
+        from server.agent import Agent
+
+        agent = Agent(
+            data_dir=str(tmp_path / "eval_data"),
+            default_model="test",
+            use_tool_registry=True,
+            tool_retrieval_mode="all",
+        )
+        agent._registry = mock_registry
+        agent._embedding = mock_embedding
+        return agent
+
+
+class TestLiveRun:
+    def test_run_live_executes_agent_and_collects_results(self, tmp_path):
+        """Live runner should execute tasks through Agent.run and inspect telemetry."""
+        from evals.local_ml_eval.runner import load_tasks, run_live
+
+        tasks = [t for t in load_tasks(TASKS_PATH) if t["id"] in {
+            "memory_001",
+            "retrieval_001",
+            "missing_001",
+            "generated_001",
+        }]
+
+        result = run_live(
+            tasks,
+            agent_factory=lambda: _make_eval_agent(tmp_path),
+            model="test",
+        )
+
+        by_id = {row["id"]: row for row in result["results"]}
+
+        assert result["valid"] is True
+        assert len(by_id) == 4
+        assert by_id["memory_001"]["task_success"] is True
+        assert by_id["retrieval_001"]["expected_tool_hit"] is True
+        assert by_id["missing_001"]["tool_requested"] is True
+        assert by_id["generated_001"]["generated_tool_success"] is True
+        assert result["metrics"]["generated_tool_success_rate"] == 1.0
+        assert result["metrics"]["tool_request_rate"] == 0.25
+        assert result["metrics"]["avg_latency_ms"] is not None

@@ -194,17 +194,27 @@ Tests the full pipeline: ToolRequest → FakeDeveloper → Verifier → Registry
 
 ### Run eval harness
 ```bash
-# Dry-run (validate tasks, output skeleton report)
+# Dry-run (validate tasks, output skeleton report with placeholder metrics)
 python -m evals.local_ml_eval.runner \
   --tasks evals/local_ml_eval/tasks.jsonl \
   --output /tmp/local_ml_eval_report.json \
   --dry-run
+
+# Live execution through Agent.run using offline fixture integrations
+python -m evals.local_ml_eval.runner \
+  --tasks evals/local_ml_eval/tasks.jsonl \
+  --output /tmp/local_ml_eval_report.json \
+  --markdown /tmp/local_ml_eval_report.md
 
 # View report
 cat /tmp/local_ml_eval_report.json
 ```
 
 Tasks are in `evals/local_ml_eval/tasks.jsonl` (20 tasks: 5 memory, 5 retrieval, 5 missing, 5 generated).
+Live mode executes the real `Agent.run -> registry -> router -> telemetry`
+path. By default it connects offline fixture integrations for Obsidian /
+Calendar / Email and pre-registers generated tool fixtures so the harness can
+run without external accounts.
 
 ## Known Limitations
 

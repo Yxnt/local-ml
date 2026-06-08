@@ -179,6 +179,33 @@ absorber.get_lineage("merged_tool_name")
 # Returns list of {parent_tool_name, relation, created_at}
 ```
 
+## Verification & Evaluation
+
+### Verify tool evolution infrastructure
+```bash
+bash scripts/verify_tool_evolution.sh
+```
+
+### Run E2E smoke test
+```bash
+pytest tests/e2e/test_tool_evolution_smoke.py -q
+```
+Tests the full pipeline: ToolRequest → FakeDeveloper → Verifier → Registry → Execute → Promote → EGL.
+
+### Run eval harness
+```bash
+# Dry-run (validate tasks, output skeleton report)
+python -m evals.local_ml_eval.runner \
+  --tasks evals/local_ml_eval/tasks.jsonl \
+  --output /tmp/local_ml_eval_report.json \
+  --dry-run
+
+# View report
+cat /tmp/local_ml_eval_report.json
+```
+
+Tasks are in `evals/local_ml_eval/tasks.jsonl` (20 tasks: 5 memory, 5 retrieval, 5 missing, 5 generated).
+
 ## Known Limitations
 
 1. **sqlite-vec dependency**: Semantic search requires sqlite-vec. Without it, falls back to keyword matching.
@@ -187,3 +214,7 @@ absorber.get_lineage("merged_tool_name")
 4. **No real regression tests**: `_run_parent_tests()` in absorber is a simplified schema check, not a full replay of historical invocations.
 5. **Darwinian Evolver**: external CLI must be installed separately. Only synthetic test data is passed.
 6. **EGL time windows**: 24h/7d windows depend on `created_at` timestamps being accurate.
+7. **Agent.run does NOT auto-generate tools**: `tool_not_found` only records a ToolRequest. Tool generation is explicit via CLI/admin.
+8. **Agent.run does NOT auto-run absorber**: Absorber is only triggered via `ToolEvolutionOrchestrator` / CLI.
+9. **Darwinian Evolver is disabled by default**: Must be explicitly enabled in config.
+10. **GEPA/BootstrapFewShot only via CLI/admin**: Not triggered from Agent.run().

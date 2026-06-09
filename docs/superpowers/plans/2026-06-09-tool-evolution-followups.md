@@ -30,6 +30,8 @@ The plan intentionally avoids changing prompt topology, workflow graphs, memory 
 | `tests/tools/test_local_pool.py` | Unit coverage for local registration, deduped tool listing, and dispatch via the existing router contract |
 | `server/agent.py` | Wires optional in-situ generation into the existing tool loop with legacy fallback preserved |
 | `tests/server/test_agent_in_situ_generation.py` | Agent-level tests for same-run generated tool use, blocked risk, and bounded retries |
+| `server/tools/local_candidates.py` | Persists query-local generated tools as candidate specs/source for later batch absorption |
+| `tests/tools/test_local_candidates.py` | Unit coverage for exporting local tools without promoting them to active global tools |
 | `server/tools/absorber.py` | Extends parent test checks to replay `ToolSpec.metadata["replay_cases"]` against merged tools |
 | `tests/tools/test_absorber_e2e.py` | Adds replay success and replay-failure merge-blocking coverage |
 | `evals/local_ml_eval/metrics.py` | Splits creation-pressure EGL from generated-tool use and adds self-evolution rates |
@@ -549,17 +551,23 @@ async def test_dispatch_generates_safe_missing_tool_and_retries_locally(agent: A
         local_tool_pool=agent._create_local_tool_pool(),
         attempted_generation=set(),
     )
+    created_events = []
 
     async def missing_dispatch(name, args, tool_ctx):
         return ToolResult(content=f"未知工具: {name}", success=False, error_type="tool_not_found")
 
     agent._tool_registry.dispatch = missing_dispatch
+    agent._tool_telemetry.record_tool_created = (
+        lambda name, version="", **kw: created_events.append((name, version, kw)) or 1
+    )
 
     content = await agent._dispatch_tool("text_reverse", {"text": "abc"}, ctx)
 
     assert json.loads(content) == {"result": "cba"}
     assert (Path(agent._tool_sandbox_dir) / "text_reverse.py").exists()
     assert "text_reverse" in ctx.attempted_generation
+    assert created_events[0][0] == "text_reverse"
+    assert created_events[0][2]["metadata"]["source"] == "in_situ_local"
 
 
 @pytest.mark.asyncio
@@ -645,6 +653,22 @@ self._tool_risk_classifier = tool_risk_classifier
 ```
 
 - [ ] **Step 4: Initialize default developer/verifier/classifier only when enabled**
+
+In `_init_tool_system()`, make the generated executor use the same sandbox as query-local generated tools:
+
+```python
+generated_executor = GeneratedPythonExecutor(sandbox_dir=self._tool_sandbox_dir)
+
+self._tool_router = ToolRuntimeRouter(
+    memory_executor=memory_executor,
+    integration_executor=integration_executor,
+    computer_executor=computer_executor,
+    generated_executor=generated_executor,
+    telemetry=self._tool_telemetry,
+)
+```
+
+This replaces the current `generated_executor=GeneratedPythonExecutor()` call. The same-run execution path depends on this: `LocalToolPool.register()` writes `<tool_name>.py` into `self._tool_sandbox_dir`, and `GeneratedPythonExecutor` must read from that same directory.
 
 At the end of `_init_tool_system()`, after the router exists, add:
 
@@ -873,6 +897,16 @@ async def _try_in_situ_generation(
     spec = self._build_generated_tool_spec(request)
     dispatch_ctx.local_tool_pool.register(spec, source_code)
     request.metadata["in_situ_generation"] = {"success": True}
+    if self._tool_telemetry is not None:
+        self._tool_telemetry.record_tool_created(
+            request.candidate_name,
+            metadata={
+                "source": "in_situ_local",
+                "task_id": request.task_id,
+                "session_id": request.session_id,
+                "risk_classifier": request.metadata.get("risk_classifier", {}),
+            },
+        )
     return await dispatch_ctx.local_tool_pool.dispatch(request.candidate_name, args, ctx)
 
 
@@ -897,9 +931,11 @@ def _build_generated_tool_spec(self, request: Any) -> Any:
     )
 ```
 
-- [ ] **Step 11: Ensure blocked/successful requests are visible in telemetry**
+- [ ] **Step 11: Ensure blocked, failed, and successful generation are visible in telemetry**
 
-Inside `_try_in_situ_generation`, after classifier annotation and before returning for blocked requests, do not record telemetry there. Keep the single `record_tool_request(req)` call in `_dispatch_tool` after `_try_in_situ_generation()` returns `None`; this ensures both blocked and failed generation attempts retain classifier metadata. Successful local generation can remain query-local and does not need durable registry mutation in PR A.
+Inside `_try_in_situ_generation`, after classifier annotation and before returning for blocked requests, do not record telemetry there. Keep the single `record_tool_request(req)` call in `_dispatch_tool` after `_try_in_situ_generation()` returns `None`; this ensures both blocked and failed generation attempts retain classifier metadata.
+
+For successful local generation, do not mutate the durable global registry in PR A, but do emit `record_tool_created()` with `metadata["source"] == "in_situ_local"` and the classifier decision. PR C uses this event to compute `evolution_growth_level`; without it, successful query-local generation is invisible to the eval harness.
 
 - [ ] **Step 12: Run focused Agent tests**
 
@@ -922,9 +958,268 @@ git commit -m "feat: enable optional in-situ tool generation"
 
 ---
 
+### Task 4: Export Query-Local Tools as Absorber Candidates
+
+**Files:**
+- Create: `server/tools/local_candidates.py`
+- Create: `tests/tools/test_local_candidates.py`
+- Modify: `server/agent.py`
+- Modify: `server/tools/__init__.py`
+
+- [ ] **Step 1: Write failing candidate export tests**
+
+Create `tests/tools/test_local_candidates.py`:
+
+```python
+from pathlib import Path
+
+from server.tools.local_candidates import LocalCandidateExporter
+from server.tools.local_pool import LocalToolPool
+from server.tools.spec import RiskLevel, ToolRuntime, ToolSpec, ToolStatus
+
+
+class FakeRouter:
+    async def dispatch(self, spec, arguments, ctx):
+        raise AssertionError("dispatch is not used by candidate export")
+
+
+class FakeRegistry:
+    def __init__(self) -> None:
+        self.registered = []
+
+    def get_tool(self, name: str):
+        return None
+
+    def register(self, spec: ToolSpec):
+        self.registered.append(spec)
+
+
+class FakeTelemetry:
+    def __init__(self) -> None:
+        self.events = []
+
+    def record_tool_registered(self, name, version="", **kw):
+        self.events.append((name, version, kw))
+        return len(self.events)
+
+
+def _spec(name: str) -> ToolSpec:
+    return ToolSpec(
+        name=name,
+        description="Reverse provided text",
+        input_schema={
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+        output_schema={
+            "type": "object",
+            "properties": {"result": {"type": "string"}},
+        },
+        runtime=ToolRuntime.PYTHON_GENERATED,
+        provider="query_local",
+        risk_level=RiskLevel.L0,
+        metadata={"replay_cases": [{"arguments": {"text": "abc"}, "expect": {"result": "cba"}}]},
+    )
+
+
+def test_export_registers_local_tools_as_candidates(tmp_path: Path):
+    pool = LocalToolPool(router=FakeRouter(), sandbox_dir=str(tmp_path / "local"))
+    pool.register(_spec("text_reverse"), "source code")
+    registry = FakeRegistry()
+    telemetry = FakeTelemetry()
+
+    exported = LocalCandidateExporter(
+        registry=registry,
+        telemetry=telemetry,
+        candidate_dir=str(tmp_path / "candidates"),
+    ).export(pool, task_id="task1", batch_id="batch1")
+
+    assert [spec.name for spec in exported] == ["text_reverse"]
+    assert registry.registered[0].status == ToolStatus.CANDIDATE
+    assert registry.registered[0].provider == "query_local_candidate"
+    assert registry.registered[0].metadata["absorber_candidate"] is True
+    assert registry.registered[0].metadata["task_id"] == "task1"
+    assert registry.registered[0].metadata["batch_id"] == "batch1"
+    assert Path(registry.registered[0].metadata["source_file"]).read_text(encoding="utf-8") == "source code"
+    assert telemetry.events[0][2]["metadata"]["source"] == "local_candidate_export"
+
+
+def test_export_skips_names_that_already_exist_in_registry(tmp_path: Path):
+    pool = LocalToolPool(router=FakeRouter(), sandbox_dir=str(tmp_path / "local"))
+    pool.register(_spec("text_reverse"), "source code")
+
+    class RegistryWithExisting(FakeRegistry):
+        def get_tool(self, name: str):
+            return _spec(name)
+
+    exported = LocalCandidateExporter(
+        registry=RegistryWithExisting(),
+        telemetry=None,
+        candidate_dir=str(tmp_path / "candidates"),
+    ).export(pool, task_id="task1")
+
+    assert exported == []
+```
+
+- [ ] **Step 2: Run the test and verify it fails because the module is absent**
+
+Run: `python -m pytest tests/tools/test_local_candidates.py -q`
+
+Expected: FAIL with `ModuleNotFoundError: No module named 'server.tools.local_candidates'`.
+
+- [ ] **Step 3: Implement candidate exporter**
+
+Create `server/tools/local_candidates.py`:
+
+```python
+"""Export query-local generated tools as absorber candidates."""
+
+from __future__ import annotations
+
+import shutil
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+from server.tools.local_pool import LocalToolPool
+from server.tools.spec import ToolSpec, ToolStatus
+
+
+class LocalCandidateExporter:
+    """Persist query-local generated tools without promoting them to ACTIVE.
+
+    This is the handoff from per-query local pools `P_(t,i)` to the batch
+    absorption input. The global registry can see these as CANDIDATE tools, but
+    normal tool retrieval should continue filtering to ACTIVE tools.
+    """
+
+    def __init__(self, registry: Any, telemetry: Any = None, candidate_dir: str = "server/tools/candidates") -> None:
+        self._registry = registry
+        self._telemetry = telemetry
+        self._candidate_dir = Path(candidate_dir)
+
+    def export(self, pool: LocalToolPool, *, task_id: str, batch_id: str = "") -> list[ToolSpec]:
+        self._candidate_dir.mkdir(parents=True, exist_ok=True)
+        exported: list[ToolSpec] = []
+
+        for spec in pool.list_specs():
+            if self._registry.get_tool(spec.name) is not None:
+                continue
+
+            source_file = Path(spec.metadata["source_file"])
+            candidate_file = self._candidate_dir / f"{spec.name}.py"
+            shutil.copyfile(source_file, candidate_file)
+
+            candidate = replace(
+                spec,
+                provider="query_local_candidate",
+                status=ToolStatus.CANDIDATE,
+                metadata={
+                    **spec.metadata,
+                    "absorber_candidate": True,
+                    "task_id": task_id,
+                    "batch_id": batch_id,
+                    "source_file": str(candidate_file),
+                },
+            )
+            self._registry.register(candidate)
+            exported.append(candidate)
+
+            if self._telemetry is not None:
+                self._telemetry.record_tool_registered(
+                    candidate.name,
+                    candidate.version,
+                    metadata={
+                        "source": "local_candidate_export",
+                        "task_id": task_id,
+                        "batch_id": batch_id,
+                    },
+                )
+
+        return exported
+```
+
+- [ ] **Step 4: Export type from `server/tools/__init__.py`**
+
+Add:
+
+```python
+from server.tools.local_candidates import LocalCandidateExporter
+```
+
+and include `"LocalCandidateExporter"` in `__all__`.
+
+- [ ] **Step 5: Wire optional export at Agent task finish**
+
+Modify `Agent.__init__` to accept:
+
+```python
+tool_local_candidate_exporter: Any = None,
+tool_candidate_dir: str | None = None,
+```
+
+Store:
+
+```python
+self._tool_candidate_dir = tool_candidate_dir or os.path.join(data_dir, "generated_tool_candidates")
+self._tool_local_candidate_exporter = tool_local_candidate_exporter
+```
+
+In `_init_tool_system()`, initialize the exporter when in-situ generation is enabled:
+
+```python
+if self._enable_in_situ_tool_generation:
+    from server.tools.local_candidates import LocalCandidateExporter
+
+    self._tool_local_candidate_exporter = self._tool_local_candidate_exporter or LocalCandidateExporter(
+        registry=self._tool_registry,
+        telemetry=self._tool_telemetry,
+        candidate_dir=self._tool_candidate_dir,
+    )
+```
+
+At each task-finished path in `run()`, before `record_task_finished(...)`, export local tools if any exist:
+
+```python
+if (
+    self._tool_local_candidate_exporter is not None
+    and dispatch_ctx.local_tool_pool is not None
+    and dispatch_ctx.local_tool_pool.list_specs()
+):
+    self._tool_local_candidate_exporter.export(
+        dispatch_ctx.local_tool_pool,
+        task_id=task_id,
+        batch_id=f"session_{self._session_id}",
+    )
+```
+
+Apply this to the normal no-more-tool-calls return path and the max-rounds fallback path. Keep exported tools as `ToolStatus.CANDIDATE`; they are batch absorption inputs, not immediately promoted global tools.
+
+- [ ] **Step 6: Run candidate export tests**
+
+Run: `python -m pytest tests/tools/test_local_candidates.py -q`
+
+Expected: PASS.
+
+- [ ] **Step 7: Run Agent generation test again**
+
+Run: `python -m pytest tests/server/test_agent_in_situ_generation.py -q`
+
+Expected: PASS.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add server/tools/local_candidates.py tests/tools/test_local_candidates.py server/tools/__init__.py server/agent.py
+git commit -m "feat: export local generated tools as candidates"
+```
+
+---
+
 ## PR B: Batch Absorption and Behavioral Consolidation
 
-### Task 4: Add Replay Cases to Absorber Parent Tests
+### Task 5: Add Replay Cases to Absorber Parent Tests
 
 **Files:**
 - Modify: `server/tools/absorber.py`
@@ -935,32 +1230,56 @@ git commit -m "feat: enable optional in-situ tool generation"
 Append tests to `tests/tools/test_absorber_e2e.py`. Use the existing fixtures and fake remote generator patterns in that file:
 
 ```python
+BROKEN_MERGED_SOURCE = textwrap.dedent('''\
+    """Broken merged character counting tool."""
+
+    from pydantic import BaseModel
+
+
+    class InputModel(BaseModel):
+        text: str
+
+    class OutputModel(BaseModel):
+        char_count: int = 0
+        char_count_no_spaces: int = 0
+
+    def run(input: InputModel) -> OutputModel:
+        return OutputModel(char_count=0, char_count_no_spaces=0)
+''')
+
+
 @pytest.mark.asyncio
-async def test_absorber_replay_cases_pass_for_compatible_merge(tmp_path):
-    registry, telemetry, verifier = _make_absorber_test_stack(tmp_path)
-    registry.register(_char_counter_tool("char_counter_a", replay_cases=[
-        {
-            "name": "counts_ascii_chars",
-            "arguments": {"text": "abc"},
-            "expect": {"count": 3},
-            "match": "subset",
-        }
-    ]))
-    registry.register(_char_counter_tool("char_counter_b", replay_cases=[
-        {
-            "name": "counts_empty_string",
-            "arguments": {"text": ""},
-            "expect": {"count": 0},
-            "match": "subset",
-        }
-    ]))
+async def test_absorber_replay_cases_pass_for_compatible_merge(registry, telemetry, sandbox_dir):
+    _register_two_similar_tools(
+        registry,
+        sandbox_dir,
+        replay_cases_a=[
+            {
+                "name": "counts_ascii_chars",
+                "arguments": {"text": "abc"},
+                "expect": {"char_count": 3},
+                "match": "subset",
+            }
+        ],
+        replay_cases_b=[
+            {
+                "name": "counts_non_space_chars",
+                "arguments": {"text": "a b"},
+                "expect": {"char_count_no_spaces": 2},
+                "match": "subset",
+            }
+        ],
+    )
 
     absorber = ToolAbsorber(
         registry=registry,
         telemetry=telemetry,
-        verifier=verifier,
-        remote_generate=_fake_char_counter_merge,
-        sandbox_dir=str(tmp_path / "sandbox"),
+        verifier=FakeVerifier(should_pass=True),
+        remote_generate=_make_fake_remote_generate(
+            merge_decision=True,
+            merge_code=MERGED_SOURCE,
+        ),
+        sandbox_dir=sandbox_dir,
     )
 
     result = await absorber.run(dry_run=False)
@@ -970,31 +1289,37 @@ async def test_absorber_replay_cases_pass_for_compatible_merge(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_absorber_replay_cases_block_incompatible_merge(tmp_path):
-    registry, telemetry, verifier = _make_absorber_test_stack(tmp_path)
-    registry.register(_char_counter_tool("char_counter_a", replay_cases=[
-        {
-            "name": "protects_character_count",
-            "arguments": {"text": "abc"},
-            "expect": {"count": 3},
-            "match": "subset",
-        }
-    ]))
-    registry.register(_char_counter_tool("char_counter_b", replay_cases=[
-        {
-            "name": "protects_empty_string",
-            "arguments": {"text": ""},
-            "expect": {"count": 0},
-            "match": "subset",
-        }
-    ]))
+async def test_absorber_replay_cases_block_incompatible_merge(registry, telemetry, sandbox_dir):
+    _register_two_similar_tools(
+        registry,
+        sandbox_dir,
+        replay_cases_a=[
+            {
+                "name": "protects_character_count",
+                "arguments": {"text": "abc"},
+                "expect": {"char_count": 3},
+                "match": "subset",
+            }
+        ],
+        replay_cases_b=[
+            {
+                "name": "protects_non_space_count",
+                "arguments": {"text": "a b"},
+                "expect": {"char_count_no_spaces": 2},
+                "match": "subset",
+            }
+        ],
+    )
 
     absorber = ToolAbsorber(
         registry=registry,
         telemetry=telemetry,
-        verifier=verifier,
-        remote_generate=_fake_broken_char_counter_merge,
-        sandbox_dir=str(tmp_path / "sandbox"),
+        verifier=FakeVerifier(should_pass=True),
+        remote_generate=_make_fake_remote_generate(
+            merge_decision=True,
+            merge_code=BROKEN_MERGED_SOURCE,
+        ),
+        sandbox_dir=sandbox_dir,
     )
 
     result = await absorber.run(dry_run=False)
@@ -1004,32 +1329,29 @@ async def test_absorber_replay_cases_block_incompatible_merge(tmp_path):
     assert registry.get_tool("char_counter_merged") is None
 ```
 
-Add helper updates in the same test file:
+The important test detail is that this uses existing `registry`, `telemetry`, `sandbox_dir`, `_register_two_similar_tools()`, `FakeVerifier`, `MERGED_SOURCE`, and `_make_fake_remote_generate()` symbols from the file. Do not add new test-stack helpers when the existing fixtures already provide the needed registry, telemetry, and sandbox.
+
+Update the existing `_register_two_similar_tools()` helper to accept replay cases and attach them before registration:
 
 ```python
-def _char_counter_tool(name: str, replay_cases: list[dict] | None = None) -> ToolSpec:
-    spec = ToolSpec(
-        name=name,
-        description="Count characters in text",
-        input_schema={
-            "type": "object",
-            "properties": {"text": {"type": "string"}},
-            "required": ["text"],
-        },
-        output_schema={
-            "type": "object",
-            "properties": {"count": {"type": "integer"}},
-        },
-        runtime=ToolRuntime.PYTHON_GENERATED,
-        provider="generated_fixture",
-        risk_level=RiskLevel.L0,
-        status=ToolStatus.ACTIVE,
-        metadata={},
-        embedding=[0.1] * 8,
-    )
-    if replay_cases:
-        spec.metadata["replay_cases"] = replay_cases
-    return spec
+def _register_two_similar_tools(
+    registry: ToolRegistry,
+    sandbox_dir: str,
+    embedding_dim: int = 768,
+    replay_cases_a: list[dict[str, Any]] | None = None,
+    replay_cases_b: list[dict[str, Any]] | None = None,
+) -> tuple[ToolSpec, ToolSpec]:
+    ...
+    spec_a = ToolSpec(...)
+    spec_b = ToolSpec(...)
+    if replay_cases_a:
+        spec_a.metadata["replay_cases"] = replay_cases_a
+    if replay_cases_b:
+        spec_b.metadata["replay_cases"] = replay_cases_b
+
+    registry.register(spec_a)
+    registry.register(spec_b)
+    return spec_a, spec_b
 ```
 
 - [ ] **Step 2: Run the new absorber tests and verify replay is not enforced**
@@ -1155,7 +1477,7 @@ git commit -m "feat: enforce absorber replay cases"
 
 ## PR C: Evolution Monitoring and Self-Evolution Eval
 
-### Task 5: Split EGL and Generated-Tool Use Metrics
+### Task 6: Split EGL and Generated-Tool Use Metrics
 
 **Files:**
 - Modify: `evals/local_ml_eval/metrics.py`
@@ -1351,7 +1673,7 @@ git commit -m "feat: split self evolution eval metrics"
 
 ---
 
-### Task 6: Add Zero-Start and Warm-Start Eval Observability
+### Task 7: Add Zero-Start and Warm-Start Eval Observability
 
 **Files:**
 - Modify: `evals/local_ml_eval/runner.py`
@@ -1388,7 +1710,7 @@ Append rows to `evals/local_ml_eval/tasks.jsonl`:
 {"id": "evolve_warm_001", "category": "generated_tool", "mode": "warm-start", "input": "再次把文本 abc 反转", "expected_tools": ["text_reverse"], "forbidden_tools": ["computer_action"], "success_check": "tool_called", "risk_level": "L0"}
 ```
 
-- [ ] **Step 3: Extend fixture generated tools**
+- [ ] **Step 3: Extend generated fixtures and add a deterministic in-situ developer**
 
 Add `text_reverse` and `slugify_text` entries to the generated fixture map in `evals/local_ml_eval/fixtures.py`:
 
@@ -1443,19 +1765,126 @@ def run(input: InputModel) -> OutputModel:
 },
 ```
 
-- [ ] **Step 4: Emit per-result evolution fields from runner**
+Add deterministic developer/verifier fixtures so zero-start eval can synthesize without a remote MIMO call:
+
+```python
+class OfflineToolDeveloper:
+    async def generate(self, request: Any) -> dict[str, Any]:
+        fixture = _GENERATED_TOOL_FIXTURES.get(request.candidate_name)
+        if fixture is None:
+            return {
+                "success": False,
+                "tool_name": request.candidate_name,
+                "source_code": None,
+                "file_path": None,
+                "error": f"No generated fixture for {request.candidate_name}",
+            }
+        return {
+            "success": True,
+            "tool_name": request.candidate_name,
+            "source_code": fixture["source"],
+            "file_path": None,
+            "error": None,
+        }
+```
+
+Use the real `ToolVerifier` in the runner so fixture source still goes through the same static/sandbox verification path as normal generated code.
+
+- [ ] **Step 4: Add explicit zero-start and warm-start runner modes**
+
+Modify `evals/local_ml_eval/runner.py` so live execution has an `evolution_mode` option with these semantics:
+
+```python
+# "fixture" keeps today's default behavior for existing tests.
+# "zero-start" runs only tasks with mode == "zero-start", does not preinstall
+# generated fixtures, and builds Agent with enable_in_situ_tool_generation=True
+# plus OfflineToolDeveloper.
+# "warm-start" runs only tasks with mode == "warm-start", preinstalls generated
+# fixtures, and verifies reuse without new synthesis.
+parser.add_argument(
+    "--evolution-mode",
+    choices=["fixture", "zero-start", "warm-start"],
+    default="fixture",
+)
+```
+
+Before execution, filter tasks when a self-evolution mode is selected:
+
+```python
+if args.evolution_mode in {"zero-start", "warm-start"}:
+    tasks = [task for task in tasks if task.get("mode") == args.evolution_mode]
+```
+
+Update `_build_live_agent()` to accept `evolution_mode` and build the zero-start agent with in-situ generation enabled:
+
+```python
+def _build_live_agent(*, data_dir: str | None, model: str, evolution_mode: str = "fixture"):
+    from server.agent import Agent
+    from server.tools.risk_classifier import CapabilityRiskClassifier
+    from server.tools.verifier import ToolVerifier
+    from evals.local_ml_eval.fixtures import OfflineToolDeveloper
+
+    kwargs: dict[str, Any] = {
+        "data_dir": data_dir or tempfile.mkdtemp(prefix="local_ml_eval_"),
+        "default_model": model,
+        "use_tool_registry": True,
+        "tool_retrieval_mode": "all",
+    }
+    if evolution_mode == "zero-start":
+        sandbox_dir = str(Path(kwargs["data_dir"]) / "generated_tools")
+        kwargs.update(
+            {
+                "enable_in_situ_tool_generation": True,
+                "tool_sandbox_dir": sandbox_dir,
+                "tool_developer": OfflineToolDeveloper(),
+                "tool_verifier": ToolVerifier(sandbox_dir=sandbox_dir),
+                "tool_risk_classifier": CapabilityRiskClassifier(),
+            }
+        )
+    return Agent(**kwargs)
+```
+
+Set generated fixture installation from mode:
+
+```python
+if evolution_mode == "warm-start":
+    install_generated_tool_fixtures(agent)
+elif evolution_mode == "fixture" and generated_tool_fixtures:
+    install_generated_tool_fixtures(agent)
+```
+
+- [ ] **Step 5: Emit per-result evolution fields from runner**
 
 In `evals/local_ml_eval/runner.py`, extend `_execute_task()` result construction:
 
 ```python
-tool_invocation_count = len(tool_rows)
-created_rows = _rows_since(conn, "tool_events", before_tool_event_id)
-generated_tools_created = sum(1 for row in created_rows if row.get("event_type") == "tool_created")
-in_situ_generation_attempted = any(
-    row.get("metadata", {}).get("risk_classifier", {}).get("auto_generatable") is not None
-    for row in request_rows
+def _metadata(row: dict[str, Any]) -> dict[str, Any]:
+    value = row.get("metadata") or "{}"
+    if isinstance(value, dict):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+
+
+tool_invocation_count = len(invoked_tools)
+created_events = [
+    row for row in events
+    if row.get("event_type") == "tool_created"
+]
+generated_tools_created = sum(
+    1 for row in created_events
+    if _metadata(row).get("source") in {"in_situ_local", "absorber"}
 )
-in_situ_generation_success = generated_tools_created > 0 and in_situ_generation_attempted
+in_situ_generation_attempted = any(
+    _metadata(row).get("risk_classifier", {}).get("auto_generatable") is not None
+    for row in requests
+)
+in_situ_generation_success = any(
+    _metadata(row).get("source") == "in_situ_local"
+    for row in created_events
+)
 warm_start_reused_generated_tool = (
     task.get("mode") == "warm-start"
     and generated_tool_success
@@ -1463,7 +1892,7 @@ warm_start_reused_generated_tool = (
 )
 ```
 
-If telemetry metadata is stored as JSON text in `request_rows`, parse it with `json.loads()` before accessing nested fields.
+If telemetry metadata is stored as JSON text in `requests`, parse it with `json.loads()` before accessing nested fields.
 
 Add fields to the result dict:
 
@@ -1476,17 +1905,33 @@ Add fields to the result dict:
 "warm_start_reused_generated_tool": warm_start_reused_generated_tool,
 ```
 
-- [ ] **Step 5: Ensure fixture mode produces stable warm-start reuse**
+- [ ] **Step 6: Ensure eval modes measure distinct self-evolution behavior**
 
-When `generated_tool_fixtures=True`, fixture tools are already installed before the run. For zero-start testing with no preinstalled generated tools, the user can run with `--no-generated-tool-fixtures` after PR A is complete. Do not mutate global registry mid-eval in this task; just expose fields that allow both modes to be measured.
+Add tests that prove the modes are not accidentally collapsed:
 
-- [ ] **Step 6: Run task and live eval tests**
+```python
+def test_zero_start_mode_does_not_preinstall_generated_fixtures(tmp_path):
+    agent = _build_live_agent(data_dir=str(tmp_path), model="test", evolution_mode="zero-start")
+    assert agent._tool_registry.get_tool("text_reverse") is None
+    assert agent._enable_in_situ_tool_generation is True
+
+
+def test_warm_start_mode_uses_existing_generated_fixtures(tmp_path):
+    agent = _build_live_agent(data_dir=str(tmp_path), model="test", evolution_mode="warm-start")
+    _prepare_generated_executor(agent, str(tmp_path))
+    install_generated_tool_fixtures(agent)
+    assert agent._tool_registry.get_tool("text_reverse") is not None
+```
+
+Run zero-start eval with `--evolution-mode zero-start`; run warm-start eval with `--evolution-mode warm-start`. The default fixture mode remains available for existing smoke tests.
+
+- [ ] **Step 7: Run task and live eval tests**
 
 Run: `python -m pytest tests/evals/test_local_ml_eval.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add evals/local_ml_eval/runner.py evals/local_ml_eval/tasks.jsonl evals/local_ml_eval/fixtures.py tests/evals/test_local_ml_eval.py
@@ -1495,7 +1940,7 @@ git commit -m "feat: add self evolution eval modes"
 
 ---
 
-### Task 7: Update Tool Evolution Docs and Verification Script
+### Task 8: Update Tool Evolution Docs and Verification Script
 
 **Files:**
 - Modify: `docs/tool_evolution.md`
@@ -1607,7 +2052,7 @@ git status --short
 git log --oneline -7
 ```
 
-Expected: working tree is clean after the task commits, and the recent commits match the seven task-level commits above.
+Expected: working tree is clean after the task commits, and the recent commits match the eight task-level commits above.
 
 ---
 

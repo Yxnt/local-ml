@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import argparse
+import inspect
 import json
 import sys
 import tempfile
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from evals.local_ml_eval.fixtures import (
+    OfflineToolDeveloper,
     install_fixture_integrations,
     install_generated_tool_fixtures,
 )
@@ -50,6 +52,8 @@ def validate_task(task: dict[str, Any]) -> list[str]:
         errors.append("expected_tools must be a list")
     if "forbidden_tools" in task and not isinstance(task["forbidden_tools"], list):
         errors.append("forbidden_tools must be a list")
+    if task.get("mode") is not None and task["mode"] not in {"zero-start", "warm-start"}:
+        errors.append("mode must be one of: warm-start, zero-start")
     return errors
 
 
@@ -68,6 +72,7 @@ def run_dry(tasks: list[dict[str, Any]]) -> dict[str, Any]:
         results.append({
             "id": task["id"],
             "category": task.get("category", "unknown"),
+            "mode": task.get("mode"),
             "task_success": None,
             "expected_tool_hit": None,
             "forbidden_tool_called": None,
@@ -75,6 +80,11 @@ def run_dry(tasks: list[dict[str, Any]]) -> dict[str, Any]:
             "tool_requested": None,
             "generated_tool_success": None,
             "tool_called": None,
+            "tool_invocation_count": None,
+            "generated_tools_created": None,
+            "in_situ_generation_attempted": None,
+            "in_situ_generation_success": None,
+            "warm_start_reused_generated_tool": None,
             "latency_ms": None,
             "note": "dry-run — not executed",
         })
@@ -91,6 +101,7 @@ def run_live(
     data_dir: str | None = None,
     integration_fixtures: str = "offline",
     generated_tool_fixtures: bool = True,
+    evolution_mode: str = "fixture",
 ) -> dict[str, Any]:
     """Execute eval tasks through the real Agent.run path."""
     return asyncio.run(
@@ -101,6 +112,7 @@ def run_live(
             data_dir=data_dir,
             integration_fixtures=integration_fixtures,
             generated_tool_fixtures=generated_tool_fixtures,
+            evolution_mode=evolution_mode,
         )
     )
 
@@ -113,21 +125,26 @@ async def _run_live_async(
     data_dir: str | None,
     integration_fixtures: str,
     generated_tool_fixtures: bool,
+    evolution_mode: str,
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     all_valid = True
+    selected_tasks = _filter_tasks_by_evolution_mode(tasks, evolution_mode)
 
     agent = agent_factory() if agent_factory is not None else _build_live_agent(
         data_dir=data_dir,
         model=model,
+        evolution_mode=evolution_mode,
     )
     try:
         _prepare_generated_executor(agent, data_dir)
         await install_fixture_integrations(agent, mode=integration_fixtures)
-        if generated_tool_fixtures:
+        if evolution_mode == "warm-start":
+            install_generated_tool_fixtures(agent)
+        elif evolution_mode == "fixture" and generated_tool_fixtures:
             install_generated_tool_fixtures(agent)
 
-        for task in tasks:
+        for task in selected_tasks:
             errors = validate_task(task)
             if errors:
                 all_valid = False
@@ -139,18 +156,58 @@ async def _run_live_async(
         await agent.close()
 
     metrics = compute_metrics(results)
-    return {"metrics": metrics, "results": results, "valid": all_valid, "total_tasks": len(tasks)}
+    return {
+        "metrics": metrics,
+        "results": results,
+        "valid": all_valid,
+        "total_tasks": len(selected_tasks),
+    }
 
 
-def _build_live_agent(*, data_dir: str | None, model: str):
+def _filter_tasks_by_evolution_mode(
+    tasks: list[dict[str, Any]],
+    evolution_mode: str,
+) -> list[dict[str, Any]]:
+    if evolution_mode in {"zero-start", "warm-start"}:
+        return [task for task in tasks if task.get("mode") == evolution_mode]
+    return tasks
+
+
+def _build_live_agent(*, data_dir: str | None, model: str, evolution_mode: str = "fixture"):
     from server.agent import Agent
 
-    return Agent(
-        data_dir=data_dir or tempfile.mkdtemp(prefix="local_ml_eval_"),
-        default_model=model,
-        use_tool_registry=True,
-        tool_retrieval_mode="all",
-    )
+    resolved_data_dir = data_dir or tempfile.mkdtemp(prefix="local_ml_eval_")
+    kwargs: dict[str, Any] = {
+        "data_dir": resolved_data_dir,
+        "default_model": model,
+        "use_tool_registry": True,
+        "tool_retrieval_mode": "all",
+    }
+
+    if evolution_mode == "zero-start":
+        supported = set(inspect.signature(Agent).parameters)
+        sandbox_dir = str(Path(resolved_data_dir) / "generated_tools")
+        in_situ_kwargs: dict[str, Any] = {
+            "enable_in_situ_tool_generation": True,
+            "tool_sandbox_dir": sandbox_dir,
+            "tool_developer": OfflineToolDeveloper(),
+        }
+        if {"tool_verifier", "tool_risk_classifier"} & supported:
+            try:
+                from server.tools.risk_classifier import CapabilityRiskClassifier
+                from server.tools.verifier import ToolVerifier
+
+                in_situ_kwargs.update(
+                    {
+                        "tool_verifier": ToolVerifier(sandbox_dir=sandbox_dir),
+                        "tool_risk_classifier": CapabilityRiskClassifier(),
+                    }
+                )
+            except ImportError:
+                pass
+        kwargs.update({key: value for key, value in in_situ_kwargs.items() if key in supported})
+
+    return Agent(**kwargs)
 
 
 def _prepare_generated_executor(agent: Any, data_dir: str | None) -> None:
@@ -209,10 +266,34 @@ async def _execute_task(agent: Any, task: dict[str, Any], *, model: str) -> dict
         and expected_tool_hit
         and not tool_failed
     )
+    tool_invocation_count = len(invoked_tools)
+    created_events = [
+        row for row in events
+        if row.get("event_type") == "tool_created"
+    ]
+    generated_tools_created = sum(
+        1 for row in created_events
+        if _metadata(row).get("source") in {"in_situ_local", "absorber"}
+    )
+    in_situ_generation_attempted = any(
+        row.get("event_type") == "tool_generation_attempted"
+        and _metadata(row).get("source") == "in_situ_local"
+        for row in events
+    )
+    in_situ_generation_success = any(
+        _metadata(row).get("source") == "in_situ_local"
+        for row in created_events
+    )
+    warm_start_reused_generated_tool = (
+        task.get("mode") == "warm-start"
+        and generated_tool_success
+        and generated_tools_created == 0
+    )
 
     return {
         "id": task["id"],
         "category": task.get("category", "unknown"),
+        "mode": task.get("mode"),
         "task_success": _is_task_success(
             task,
             expected_tool_hit=expected_tool_hit,
@@ -226,12 +307,28 @@ async def _execute_task(agent: Any, task: dict[str, Any], *, model: str) -> dict
         "tool_requested": tool_requested,
         "generated_tool_success": generated_tool_success,
         "tool_called": tool_called,
+        "tool_invocation_count": tool_invocation_count,
+        "generated_tools_created": generated_tools_created,
+        "in_situ_generation_attempted": in_situ_generation_attempted,
+        "in_situ_generation_success": in_situ_generation_success,
+        "warm_start_reused_generated_tool": warm_start_reused_generated_tool,
         "latency_ms": latency_ms,
         "response": response,
         "invoked_tools": invoked_tools,
         "requested_tools": requested_tools,
         "note": "executed",
     }
+
+
+def _metadata(row: dict[str, Any]) -> dict[str, Any]:
+    value = row.get("metadata") or "{}"
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _is_task_success(
@@ -253,6 +350,7 @@ def _build_invalid_result(task: dict[str, Any], errors: list[str]) -> dict[str, 
     return {
         "id": task.get("id", "unknown"),
         "category": task.get("category", "unknown"),
+        "mode": task.get("mode"),
         "task_success": False,
         "expected_tool_hit": False,
         "forbidden_tool_called": False,
@@ -260,6 +358,11 @@ def _build_invalid_result(task: dict[str, Any], errors: list[str]) -> dict[str, 
         "tool_requested": False,
         "generated_tool_success": False,
         "tool_called": False,
+        "tool_invocation_count": 0,
+        "generated_tools_created": 0,
+        "in_situ_generation_attempted": False,
+        "in_situ_generation_success": False,
+        "warm_start_reused_generated_tool": False,
         "latency_ms": None,
         "note": f"invalid task: {'; '.join(errors)}",
     }
@@ -294,9 +397,16 @@ def main() -> None:
         action="store_true",
         help="Do not pre-register generated tool fixtures before live execution.",
     )
+    parser.add_argument(
+        "--evolution-mode",
+        choices=("fixture", "zero-start", "warm-start"),
+        default="fixture",
+        help="Select fixture smoke mode or self-evolution zero/warm-start mode.",
+    )
     args = parser.parse_args()
 
     tasks = load_tasks(args.tasks)
+    tasks = _filter_tasks_by_evolution_mode(tasks, args.evolution_mode)
     print(f"Loaded {len(tasks)} tasks from {args.tasks}")
 
     if args.dry_run:
@@ -330,6 +440,7 @@ def main() -> None:
             data_dir=args.data_dir,
             integration_fixtures=args.integration_fixtures,
             generated_tool_fixtures=not args.no_generated_tool_fixtures,
+            evolution_mode=args.evolution_mode,
         )
         metrics = result["metrics"]
         results = result["results"]

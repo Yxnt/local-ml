@@ -299,7 +299,57 @@ _GENERATED_TOOL_FIXTURES: dict[str, dict[str, Any]] = {
         },
         "source": """import re\nfrom pydantic import BaseModel\n\nclass InputModel(BaseModel):\n    markdown: str\n\nclass OutputModel(BaseModel):\n    plain_text: str\n\ndef run(input: InputModel) -> OutputModel:\n    text = re.sub(r\"`([^`]*)`\", r\"\\\\1\", input.markdown)\n    text = re.sub(r\"\\[(.*?)\\]\\((.*?)\\)\", r\"\\\\1\", text)\n    text = re.sub(r\"^#+\\s*\", \"\", text, flags=re.MULTILINE)\n    text = re.sub(r\"[*_>-]\", \" \", text)\n    text = re.sub(r\"\\s+\", \" \", text).strip()\n    return OutputModel(plain_text=text)\n""",
     },
+    "text_reverse": {
+        "description": "Reverse provided text.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+        "output_schema": {
+            "type": "object",
+            "properties": {"result": {"type": "string"}},
+            "required": ["result"],
+        },
+        "source": """from pydantic import BaseModel\n\nclass InputModel(BaseModel):\n    text: str\n\nclass OutputModel(BaseModel):\n    result: str\n\ndef run(input: InputModel) -> OutputModel:\n    return OutputModel(result=input.text[::-1])\n""",
+    },
+    "slugify_text": {
+        "description": "Convert text to a lowercase slug.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+        "output_schema": {
+            "type": "object",
+            "properties": {"slug": {"type": "string"}},
+            "required": ["slug"],
+        },
+        "source": """import re\nfrom pydantic import BaseModel\n\nclass InputModel(BaseModel):\n    text: str\n\nclass OutputModel(BaseModel):\n    slug: str\n\ndef run(input: InputModel) -> OutputModel:\n    slug = re.sub(r\"[^a-z0-9]+\", \"-\", input.text.lower()).strip(\"-\")\n    return OutputModel(slug=slug)\n""",
+    },
 }
+
+
+class OfflineToolDeveloper:
+    """Deterministic developer for offline self-evolution eval tasks."""
+
+    async def generate(self, request: Any) -> dict[str, Any]:
+        fixture = _GENERATED_TOOL_FIXTURES.get(request.candidate_name)
+        if fixture is None:
+            return {
+                "success": False,
+                "tool_name": request.candidate_name,
+                "source_code": None,
+                "file_path": None,
+                "error": f"No generated fixture for {request.candidate_name}",
+            }
+        return {
+            "success": True,
+            "tool_name": request.candidate_name,
+            "source_code": fixture["source"],
+            "file_path": None,
+            "error": None,
+        }
 
 
 async def install_fixture_integrations(agent: Any, mode: str = "offline") -> None:

@@ -316,6 +316,13 @@ class ToolRegistry:
                 error_type="tool_blocked",
             )
 
+        if spec.status == ToolStatus.CANDIDATE:
+            return ToolResult(
+                content=f"工具尚未激活: {name}",
+                success=False,
+                error_type="tool_candidate",
+            )
+
         if self._router is None:
             return ToolResult(
                 content="ToolRuntimeRouter 未配置",

@@ -37,7 +37,10 @@ def write_markdown_summary(metrics: dict[str, Any], output_path: str) -> None:
         f"| Tool failure rate | {metrics.get('tool_failure_rate', 'N/A')} |",
         f"| Tool request rate | {metrics.get('tool_request_rate', 'N/A')} |",
         f"| Generated tool success rate | {metrics.get('generated_tool_success_rate', 'N/A')} |",
-        f"| EGL | {metrics.get('egl', 'N/A')} |",
+        f"| Evolution growth level (EGL) | {metrics.get('evolution_growth_level', 'N/A')} |",
+        f"| Generated tool use rate | {metrics.get('generated_tool_use_rate', 'N/A')} |",
+        f"| In-situ generation success rate | {metrics.get('in_situ_generation_success_rate', 'N/A')} |",
+        f"| Warm-start reuse rate | {metrics.get('warm_start_reuse_rate', 'N/A')} |",
         f"| Avg latency (ms) | {metrics.get('avg_latency_ms', 'N/A')} |",
         "",
     ]

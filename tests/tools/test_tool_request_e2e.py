@@ -5,10 +5,10 @@ Covers the full lifecycle:
   2. Fake ToolDeveloper that returns valid Python source code
   3. Orchestrator.process_pending_requests(dry_run=False)
   4. Verify the tool is registered as CANDIDATE
-  5. Execute via registry.dispatch() (routes to GeneratedPythonExecutor subprocess)
-  6. Verify result is correct
-  7. Verify telemetry recorded tool_created, tool_invoked, tool_succeeded
-  8. promote_candidates -> verify status changes to ACTIVE
+  5. Verify CANDIDATE tools are not callable through normal registry dispatch
+  6. Validate the candidate through the runtime router and record telemetry
+  7. promote_candidates -> verify status changes to ACTIVE
+  8. Execute promoted ACTIVE tool via registry.dispatch()
 """
 
 from __future__ import annotations
@@ -175,7 +175,7 @@ def _seed_tool_request(telemetry: TelemetryService) -> None:
 
 @pytest.mark.asyncio
 async def test_full_e2e_lifecycle(orchestrator, registry_with_router, telemetry, sandbox_dir):
-    """Full lifecycle: request -> generate -> verify -> register -> dispatch -> promote."""
+    """Full lifecycle: request -> generate -> verify -> candidate -> promote -> dispatch."""
 
     # 1. Seed telemetry with a tool request
     _seed_tool_request(telemetry)
@@ -196,23 +196,32 @@ async def test_full_e2e_lifecycle(orchestrator, registry_with_router, telemetry,
     assert spec.risk_level == RiskLevel.L0
     assert spec.runtime.value == "python_generated"
 
-    # 4. Execute via registry.dispatch()
+    # 4. Candidate tools are absorber/promotion inputs, not normal dispatch targets.
     from server.tools.spec import ToolContext
     ctx = ToolContext(session_id="test-session", task_id="test-task")
-    exec_result = await registry_with_router.dispatch(
+    candidate_result = await registry_with_router.dispatch(
         "text_count_words", {"text": "hello world test"}, ctx
     )
-    assert exec_result.success is True
-    payload = json.loads(exec_result.content)
+    assert candidate_result.success is False
+    assert candidate_result.error_type == "tool_candidate"
+
+    # 5. Internal validation can still execute the candidate via the router,
+    # which records invocation/success telemetry used by promotion.
+    assert registry_with_router._router is not None
+    validation_result = await registry_with_router._router.dispatch(
+        spec, {"text": "hello world test"}, ctx
+    )
+    assert validation_result.success is True
+    payload = json.loads(validation_result.content)
     assert payload["word_count"] == 3
 
-    # 5. Verify telemetry events
+    # 6. Verify telemetry events
     stats = telemetry.get_tool_stats("text_count_words")
     assert stats.get("tool_created", 0) >= 1
     assert stats.get("tool_invoked", 0) >= 1
     assert stats.get("tool_succeeded", 0) >= 1
 
-    # 6. Promote candidates -> ACTIVE
+    # 7. Promote candidates -> ACTIVE
     promo_result = orchestrator.promote_candidates(
         min_success_count=1, min_success_rate=0.5
     )
@@ -221,6 +230,14 @@ async def test_full_e2e_lifecycle(orchestrator, registry_with_router, telemetry,
     promoted_spec = registry_with_router.get_tool("text_count_words")
     assert promoted_spec is not None
     assert promoted_spec.status == ToolStatus.ACTIVE
+
+    # 8. Promoted tools are callable through normal registry dispatch.
+    exec_result = await registry_with_router.dispatch(
+        "text_count_words", {"text": "hello world test"}, ctx
+    )
+    assert exec_result.success is True
+    payload = json.loads(exec_result.content)
+    assert payload["word_count"] == 3
 
 
 @pytest.mark.asyncio

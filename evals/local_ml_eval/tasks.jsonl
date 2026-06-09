@@ -18,3 +18,6 @@
 {"id": "generated_003", "category": "generated_tool", "input": "将JSON格式化为美化输出", "expected_tools": ["json_pretty_print"], "forbidden_tools": ["computer_action"], "success_check": "tool_called", "risk_level": "L0"}
 {"id": "generated_004", "category": "generated_tool", "input": "计算两个日期之间的天数差", "expected_tools": ["date_diff_days"], "forbidden_tools": ["computer_action"], "success_check": "tool_called", "risk_level": "L0"}
 {"id": "generated_005", "category": "generated_tool", "input": "将Markdown转换为纯文本", "expected_tools": ["markdown_to_text"], "forbidden_tools": ["computer_action"], "success_check": "tool_called", "risk_level": "L0"}
+{"id": "evolve_zero_001", "category": "generated_tool", "mode": "zero-start", "input": "把文本 Codex Rocks 反转", "expected_tools": ["text_reverse"], "forbidden_tools": ["computer_action"], "success_check": "tool_called", "risk_level": "L0"}
+{"id": "evolve_zero_002", "category": "generated_tool", "mode": "zero-start", "input": "把 hello-world 转成 slug 风格", "expected_tools": ["slugify_text"], "forbidden_tools": ["computer_action"], "success_check": "tool_called", "risk_level": "L0"}
+{"id": "evolve_warm_001", "category": "generated_tool", "mode": "warm-start", "input": "再次把文本 abc 反转", "expected_tools": ["text_reverse"], "forbidden_tools": ["computer_action"], "success_check": "tool_called", "risk_level": "L0"}

@@ -16,10 +16,12 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from server.optimization.prompt_store import PromptStore
 from server.tools.registry import ToolRegistry
+from server.tools.router import GeneratedPythonExecutor
 from server.tools.spec import (
     RiskLevel,
     ToolContext,
@@ -327,6 +329,8 @@ class ToolAbsorber:
             result["action"] = "parent_tests_failed"
             return result
 
+        replay_cases = self._collect_replay_cases(cluster)
+
         # Register merged tool
         merged_spec = ToolSpec(
             name=merged_name,
@@ -340,6 +344,8 @@ class ToolAbsorber:
             metadata={
                 "merged_from": names,
                 "merge_reason": merge_reason,
+                "replay_cases": replay_cases,
+                "replay_case_count": len(replay_cases),
                 "source_file": merge_result.get("file_path", ""),
             },
         )
@@ -585,15 +591,101 @@ class ToolAbsorber:
     async def _run_parent_tests(
         self, cluster: list[ToolSpec], merged_name: str, source_code: str
     ) -> bool:
-        """Run existing tool tests from parent tools against the merged tool.
-
-        For now, this just verifies the module can be imported and InputModel
-        can be instantiated.  A full implementation would store and replay
-        historical tool invocations.
-        """
-        # Basic import + structure check
+        """Verify structure and replay parent behavior contracts when present."""
         result = self._verifier.verify(merged_name, source_code)
-        return result.passed
+        if not result.passed:
+            return False
+
+        replay_cases = self._collect_replay_cases(cluster)
+        if not replay_cases:
+            return True
+
+        return await self._run_replay_cases(merged_name, source_code, replay_cases)
+
+    def _collect_replay_cases(self, cluster: list[ToolSpec]) -> list[dict[str, Any]]:
+        """Return replay cases declared by parent tool specs with provenance."""
+        cases: list[dict[str, Any]] = []
+        for parent in cluster:
+            raw_cases = parent.metadata.get("replay_cases", [])
+            if not isinstance(raw_cases, list):
+                logger.warning("Ignoring invalid replay_cases metadata on %s", parent.name)
+                continue
+            for case in raw_cases:
+                if not isinstance(case, dict):
+                    logger.warning("Ignoring non-object replay case on %s", parent.name)
+                    continue
+                enriched = dict(case)
+                enriched["parent_tool"] = parent.name
+                cases.append(enriched)
+        return cases
+
+    async def _run_replay_cases(
+        self,
+        merged_name: str,
+        source_code: str,
+        replay_cases: list[dict[str, Any]],
+    ) -> bool:
+        """Execute replay cases against the merged generated tool."""
+        sandbox = Path(self._sandbox_dir)
+        sandbox.mkdir(parents=True, exist_ok=True)
+        (sandbox / f"{merged_name}.py").write_text(source_code, encoding="utf-8")
+
+        executor = GeneratedPythonExecutor(sandbox_dir=str(sandbox))
+        spec = ToolSpec(
+            name=merged_name,
+            description="Merged replay target",
+            input_schema={"type": "object", "properties": {}},
+            runtime=ToolRuntime.PYTHON_GENERATED,
+            provider="merged",
+            risk_level=RiskLevel.L0,
+        )
+        ctx = ToolContext()
+
+        for case in replay_cases:
+            arguments = case.get("arguments", {})
+            if not isinstance(arguments, dict):
+                logger.warning(
+                    "Replay case %s for %s has invalid arguments",
+                    case.get("name", "<unnamed>"),
+                    case.get("parent_tool", "<unknown>"),
+                )
+                return False
+
+            replay_result = await executor.execute(spec, arguments, ctx)
+            if not replay_result.success:
+                logger.warning(
+                    "Replay case %s for %s failed: %s",
+                    case.get("name", "<unnamed>"),
+                    case.get("parent_tool", "<unknown>"),
+                    replay_result.content,
+                )
+                return False
+            if not self._matches_replay_expectation(replay_result, case):
+                logger.warning(
+                    "Replay case %s for %s did not match expectation",
+                    case.get("name", "<unnamed>"),
+                    case.get("parent_tool", "<unknown>"),
+                )
+                return False
+
+        return True
+
+    def _matches_replay_expectation(self, result: ToolResult, case: dict[str, Any]) -> bool:
+        """Match replay output using exact or top-level subset semantics."""
+        try:
+            actual = json.loads(result.content)
+        except json.JSONDecodeError:
+            return False
+
+        expected = case.get("expect", case.get("expected", case.get("expected_output", {})))
+        match = case.get("match", "subset")
+        if match == "exact":
+            return actual == expected
+        if match == "subset":
+            if not isinstance(actual, dict) or not isinstance(expected, dict):
+                return actual == expected
+            return all(actual.get(key) == value for key, value in expected.items())
+        return False
 
     # -- Lineage -------------------------------------------------------------
 

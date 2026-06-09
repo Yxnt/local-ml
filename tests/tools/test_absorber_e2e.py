@@ -90,6 +90,26 @@ MERGED_SOURCE = textwrap.dedent('''\
         return OutputModel(char_count=total, char_count_no_spaces=no_spaces)
 ''')
 
+BROKEN_MERGED_SOURCE = textwrap.dedent('''\
+    """Broken merged character counting tool.
+
+    # merged: char_counter_merged
+    """
+
+    from pydantic import BaseModel
+
+
+    class InputModel(BaseModel):
+        text: str
+
+    class OutputModel(BaseModel):
+        char_count: int = 0
+        char_count_no_spaces: int = 0
+
+    def run(input: InputModel) -> OutputModel:
+        return OutputModel(char_count=0, char_count_no_spaces=0)
+''')
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -205,7 +225,11 @@ def sandbox_dir(tmp_path):
 
 
 def _register_two_similar_tools(
-    registry: ToolRegistry, sandbox_dir: str, embedding_dim: int = 768
+    registry: ToolRegistry,
+    sandbox_dir: str,
+    embedding_dim: int = 768,
+    replay_cases_a: list[dict[str, Any]] | None = None,
+    replay_cases_b: list[dict[str, Any]] | None = None,
 ) -> tuple[ToolSpec, ToolSpec]:
     """Register two similar tools with similar embeddings. Returns (spec_a, spec_b)."""
     # Write source files to sandbox
@@ -255,6 +279,11 @@ def _register_two_similar_tools(
         status=ToolStatus.CANDIDATE,
         embedding=emb_b,
     )
+
+    if replay_cases_a:
+        spec_a.metadata["replay_cases"] = replay_cases_a
+    if replay_cases_b:
+        spec_b.metadata["replay_cases"] = replay_cases_b
 
     registry.register(spec_a)
     registry.register(spec_b)
@@ -340,6 +369,87 @@ async def test_full_merge_and_deprecate(registry, telemetry, sandbox_dir):
     events = telemetry.get_recent_events(limit=20)
     event_types = [e["event_type"] for e in events]
     assert "tool_merged" in event_types
+
+
+@pytest.mark.asyncio
+async def test_absorber_replay_cases_pass_for_compatible_merge(registry, telemetry, sandbox_dir):
+    """Replay-compatible merges preserve parent behavior contracts."""
+    _register_two_similar_tools(
+        registry,
+        sandbox_dir,
+        replay_cases_a=[
+            {
+                "name": "counts_ascii_chars",
+                "arguments": {"text": "abc"},
+                "expect": {"char_count": 3},
+                "match": "subset",
+            }
+        ],
+        replay_cases_b=[
+            {
+                "name": "counts_non_space_chars",
+                "arguments": {"text": "a b"},
+                "expect": {"char_count_no_spaces": 2},
+                "match": "subset",
+            }
+        ],
+    )
+    absorber = ToolAbsorber(
+        registry=registry,
+        telemetry=telemetry,
+        verifier=FakeVerifier(should_pass=True),
+        remote_generate=_make_fake_remote_generate(
+            merge_decision=True,
+            merge_code=MERGED_SOURCE,
+        ),
+        sandbox_dir=sandbox_dir,
+    )
+
+    result = await absorber.run(dry_run=False)
+
+    assert result["clusters_merged"] == 1
+    assert registry.get_tool("char_counter_merged") is not None
+
+
+@pytest.mark.asyncio
+async def test_absorber_replay_cases_block_incompatible_merge(registry, telemetry, sandbox_dir):
+    """Behavior-breaking merged tools are rejected even when structure verifies."""
+    _register_two_similar_tools(
+        registry,
+        sandbox_dir,
+        replay_cases_a=[
+            {
+                "name": "protects_character_count",
+                "arguments": {"text": "abc"},
+                "expect": {"char_count": 3},
+                "match": "subset",
+            }
+        ],
+        replay_cases_b=[
+            {
+                "name": "protects_non_space_count",
+                "arguments": {"text": "a b"},
+                "expect": {"char_count_no_spaces": 2},
+                "match": "subset",
+            }
+        ],
+    )
+    absorber = ToolAbsorber(
+        registry=registry,
+        telemetry=telemetry,
+        verifier=FakeVerifier(should_pass=True),
+        remote_generate=_make_fake_remote_generate(
+            merge_decision=True,
+            merge_code=BROKEN_MERGED_SOURCE,
+        ),
+        sandbox_dir=sandbox_dir,
+    )
+
+    result = await absorber.run(dry_run=False)
+
+    assert result["clusters_merged"] == 0
+    assert any(detail["action"] == "parent_tests_failed" for detail in result["details"])
+    assert registry.get_tool("char_counter_merged") is None
 
 
 @pytest.mark.asyncio

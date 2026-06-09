@@ -39,7 +39,8 @@ harness can execute end-to-end without external accounts.
   "expected_tools": ["memory_remember"],
   "forbidden_tools": ["computer_action"],
   "success_check": "tool_called",
-  "risk_level": "L0"
+  "risk_level": "L0",
+  "mode": "zero-start"
 }
 ```
 
@@ -51,6 +52,7 @@ Fields:
 - `forbidden_tools`: tools that must NOT be called
 - `success_check`: "tool_called" | "tool_request_recorded"
 - `risk_level`: L0-L5
+- `mode`: optional self-evolution mode, "zero-start" | "warm-start"
 
 ## Metrics
 
@@ -62,12 +64,22 @@ Fields:
 | tool_failure_rate | Fraction where tool execution failed |
 | tool_request_rate | Fraction where a ToolRequest was recorded |
 | generated_tool_success_rate | Fraction of generated tools that executed successfully |
-| egl | Generated tools used / total tool invocations |
+| evolution_growth_level | Generated tools created per tool invocation |
+| egl | Alias for `evolution_growth_level` |
+| generated_tool_use_rate | Generated tools successfully used per tool invocation |
+| in_situ_generation_success_rate | In-situ generated tools created per generation attempt |
+| warm_start_reuse_rate | Warm-start tasks solved by existing generated tools without new synthesis |
 | avg_latency_ms | Average task latency |
 
 ## Modes
 
 - `--dry-run`: validate task structure only; metrics are placeholders (`null`)
 - default live mode: execute tasks through `Agent.run`
+- `--evolution-mode zero-start`: run only zero-start tasks without pre-registering generated fixtures
+- `--evolution-mode warm-start`: run only warm-start tasks with generated fixtures pre-registered
 - `--integration-fixtures none`: do not connect offline fixture integrations
 - `--no-generated-tool-fixtures`: do not pre-register generated eval tools
+
+Interpretation: early zero-start runs may show high `evolution_growth_level`.
+As the generated tool pool stabilizes, creation pressure should fall while
+`generated_tool_use_rate` and `warm_start_reuse_rate` rise.

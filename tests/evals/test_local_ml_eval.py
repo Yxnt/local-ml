@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -49,6 +50,26 @@ class TestTasksJsonl:
         assert "missing_tool" in categories
         assert "generated_tool" in categories
 
+    def test_tasks_include_self_evolution_modes(self):
+        """Self-evolution tasks should distinguish zero-start from warm-start."""
+        from evals.local_ml_eval.runner import load_tasks
+
+        tasks = load_tasks(TASKS_PATH)
+        modes = {task.get("mode") for task in tasks if task.get("mode")}
+
+        assert "zero-start" in modes
+        assert "warm-start" in modes
+
+    def test_task_modes_are_known_when_present(self):
+        """Task mode should only use supported self-evolution values."""
+        from evals.local_ml_eval.runner import load_tasks, validate_task
+
+        tasks = load_tasks(TASKS_PATH)
+
+        for task in tasks:
+            errors = validate_task(task)
+            assert "mode must be one of: warm-start, zero-start" not in errors
+
 
 class TestDryRun:
     def test_dry_run_produces_report(self, tmp_path):
@@ -87,7 +108,11 @@ class TestDryRun:
             "tool_failure_rate",
             "tool_request_rate",
             "generated_tool_success_rate",
+            "evolution_growth_level",
             "egl",
+            "generated_tool_use_rate",
+            "in_situ_generation_success_rate",
+            "warm_start_reuse_rate",
             "avg_latency_ms",
         ]
         for field in required_fields:
@@ -129,6 +154,8 @@ class TestMetrics:
         assert m["total_tasks"] == 0
         assert m["task_success_rate"] == 0.0
         assert m["egl"] is None
+        assert m["evolution_growth_level"] is None
+        assert m["generated_tool_use_rate"] is None
 
     def test_compute_metrics_with_data(self):
         """Metrics should compute correctly from result data."""
@@ -137,13 +164,14 @@ class TestMetrics:
         results = [
             {"task_success": True, "expected_tool_hit": True, "forbidden_tool_called": False,
              "tool_failed": False, "tool_requested": False, "generated_tool_success": False,
-             "tool_called": True, "category": "memory", "latency_ms": 100},
+             "tool_called": True, "tool_invocation_count": 1, "category": "memory", "latency_ms": 100},
             {"task_success": False, "expected_tool_hit": False, "forbidden_tool_called": True,
              "tool_failed": True, "tool_requested": True, "generated_tool_success": False,
-             "tool_called": False, "category": "missing_tool", "latency_ms": 200},
+             "tool_called": False, "tool_invocation_count": 0, "category": "missing_tool", "latency_ms": 200},
             {"task_success": True, "expected_tool_hit": True, "forbidden_tool_called": False,
              "tool_failed": False, "tool_requested": False, "generated_tool_success": True,
-             "tool_called": True, "category": "generated_tool", "latency_ms": 150},
+             "tool_called": True, "tool_invocation_count": 1, "generated_tools_created": 0,
+             "category": "generated_tool", "latency_ms": 150},
         ]
 
         m = compute_metrics(results)
@@ -154,7 +182,59 @@ class TestMetrics:
         assert m["tool_failure_rate"] == round(1 / 3, 4)
         assert m["tool_request_rate"] == round(1 / 3, 4)
         assert m["generated_tool_success_rate"] == 1.0  # 1/1
+        assert m["evolution_growth_level"] == 0.0
+        assert m["egl"] == 0.0
+        assert m["generated_tool_use_rate"] == 0.5
         assert m["avg_latency_ms"] == 150.0
+
+    def test_compute_metrics_with_self_evolution_fields(self):
+        """Creation pressure and generated-tool use should be distinct signals."""
+        from evals.local_ml_eval.metrics import compute_metrics
+
+        results = [
+            {
+                "task_success": True,
+                "expected_tool_hit": True,
+                "forbidden_tool_called": False,
+                "tool_failed": False,
+                "tool_requested": True,
+                "tool_called": True,
+                "tool_invocation_count": 1,
+                "generated_tools_created": 1,
+                "generated_tool_success": True,
+                "in_situ_generation_attempted": True,
+                "in_situ_generation_success": True,
+                "mode": "zero-start",
+                "category": "generated_tool",
+                "latency_ms": 100,
+            },
+            {
+                "task_success": True,
+                "expected_tool_hit": True,
+                "forbidden_tool_called": False,
+                "tool_failed": False,
+                "tool_requested": False,
+                "tool_called": True,
+                "tool_invocation_count": 1,
+                "generated_tools_created": 0,
+                "generated_tool_success": True,
+                "in_situ_generation_attempted": False,
+                "in_situ_generation_success": False,
+                "mode": "warm-start",
+                "warm_start_reused_generated_tool": True,
+                "category": "generated_tool",
+                "latency_ms": 50,
+            },
+        ]
+
+        m = compute_metrics(results)
+
+        assert m["evolution_growth_level"] == 0.5
+        assert m["egl"] == 0.5
+        assert m["generated_tool_use_rate"] == 1.0
+        assert m["in_situ_generation_success_rate"] == 1.0
+        assert m["warm_start_reuse_rate"] == 1.0
+        assert m["tool_request_rate"] == 0.5
 
 
 class TestReport:
@@ -170,7 +250,11 @@ class TestReport:
             "tool_failure_rate": 0.05,
             "tool_request_rate": 0.15,
             "generated_tool_success_rate": 0.8,
+            "evolution_growth_level": 0.1,
             "egl": 0.1,
+            "generated_tool_use_rate": 0.7,
+            "in_situ_generation_success_rate": 0.5,
+            "warm_start_reuse_rate": 0.9,
             "avg_latency_ms": 150.0,
         }
         output = str(tmp_path / "report.json")
@@ -192,6 +276,10 @@ class TestReport:
         content = Path(output).read_text()
         assert "# local_ml_eval Report" in content
         assert "0.85" in content
+        assert "Evolution growth level (EGL)" in content
+        assert "Generated tool use rate" in content
+        assert "In-situ generation success rate" in content
+        assert "Warm-start reuse rate" in content
 
 
 class ScriptedEvalBackend(ModelBackend):
@@ -278,6 +366,30 @@ def _make_eval_agent(tmp_path: Path):
 
 
 class TestLiveRun:
+    def test_zero_start_mode_does_not_preinstall_generated_fixtures(self, tmp_path):
+        """Zero-start should rely on in-situ generation rather than fixture install."""
+        from evals.local_ml_eval.runner import _build_live_agent
+
+        agent = _build_live_agent(data_dir=str(tmp_path), model="test", evolution_mode="zero-start")
+        try:
+            assert agent._tool_registry.get_tool("text_reverse") is None
+            assert agent._tool_retrieval_mode == "all"
+        finally:
+            asyncio.run(agent.close())
+
+    def test_warm_start_mode_uses_existing_generated_fixtures(self, tmp_path):
+        """Warm-start should make generated tools available for reuse."""
+        from evals.local_ml_eval.fixtures import install_generated_tool_fixtures
+        from evals.local_ml_eval.runner import _build_live_agent, _prepare_generated_executor
+
+        agent = _build_live_agent(data_dir=str(tmp_path), model="test", evolution_mode="warm-start")
+        try:
+            _prepare_generated_executor(agent, str(tmp_path))
+            install_generated_tool_fixtures(agent)
+            assert agent._tool_registry.get_tool("text_reverse") is not None
+        finally:
+            asyncio.run(agent.close())
+
     def test_run_live_executes_agent_and_collects_results(self, tmp_path):
         """Live runner should execute tasks through Agent.run and inspect telemetry."""
         from evals.local_ml_eval.runner import load_tasks, run_live

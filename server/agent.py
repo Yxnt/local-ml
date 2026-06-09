@@ -13,6 +13,7 @@ import logging
 import os
 import sys
 import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
 # Ensure project root is on sys.path before any imports of sibling packages.
@@ -46,6 +47,14 @@ _INTEGRATION_ERRORS: dict[str, str] = {
 }
 
 
+@dataclass
+class _ToolDispatchContext:
+    task_id: str
+    user_input: str
+    local_tool_pool: Any = None
+    attempted_generation: set[str] = field(default_factory=set)
+
+
 class Agent:
     """High-level agent that orchestrates model, memory, tools, and integrations.
 
@@ -71,6 +80,13 @@ class Agent:
         tool_retrieval_top_k: int = 12,
         tool_db_path: str | None = None,
         tool_telemetry_db_path: str | None = None,
+        enable_in_situ_tool_generation: bool = False,
+        tool_sandbox_dir: str | None = None,
+        tool_candidate_dir: str | None = None,
+        tool_developer: Any = None,
+        tool_verifier: Any = None,
+        tool_risk_classifier: Any = None,
+        tool_local_candidate_exporter: Any = None,
     ) -> None:
         self._data_dir = data_dir
         self._default_model = default_model
@@ -110,6 +126,13 @@ class Agent:
         self._tool_retriever: Any = None
         self._tool_db_path: str = tool_db_path or os.path.join(data_dir, "usage.db")
         self._tool_telemetry_db_path: str = tool_telemetry_db_path or self._tool_db_path
+        self._enable_in_situ_tool_generation = enable_in_situ_tool_generation
+        self._tool_sandbox_dir = tool_sandbox_dir or os.path.join(data_dir, "generated_tools")
+        self._tool_candidate_dir = tool_candidate_dir or os.path.join(data_dir, "generated_tool_candidates")
+        self._tool_developer = tool_developer
+        self._tool_verifier = tool_verifier
+        self._tool_risk_classifier = tool_risk_classifier
+        self._tool_local_candidate_exporter = tool_local_candidate_exporter
 
         if self._use_tool_registry:
             self._init_tool_system()
@@ -157,7 +180,7 @@ class Agent:
                 memory_executor=memory_executor,
                 integration_executor=integration_executor,
                 computer_executor=computer_executor,
-                generated_executor=GeneratedPythonExecutor(),
+                generated_executor=GeneratedPythonExecutor(sandbox_dir=self._tool_sandbox_dir),
                 telemetry=self._tool_telemetry,
             )
             self._tool_registry._router = self._tool_router
@@ -170,6 +193,30 @@ class Agent:
 
             # Bootstrap existing tools into registry
             self._bootstrap_tool_registry()
+
+            if self._enable_in_situ_tool_generation:
+                from server.tools.developer import ToolDeveloper
+                from server.tools.local_candidates import LocalCandidateExporter
+                from server.tools.risk_classifier import CapabilityRiskClassifier
+                from server.tools.verifier import ToolVerifier
+
+                self._tool_developer = self._tool_developer or ToolDeveloper(
+                    sandbox_dir=self._tool_sandbox_dir
+                )
+                self._tool_verifier = self._tool_verifier or ToolVerifier(
+                    sandbox_dir=self._tool_sandbox_dir
+                )
+                self._tool_risk_classifier = (
+                    self._tool_risk_classifier or CapabilityRiskClassifier()
+                )
+                self._tool_local_candidate_exporter = (
+                    self._tool_local_candidate_exporter
+                    or LocalCandidateExporter(
+                        registry=self._tool_registry,
+                        telemetry=self._tool_telemetry,
+                        candidate_dir=self._tool_candidate_dir,
+                    )
+                )
 
             logger.info(
                 "Tool system initialised (mode=%s, top_k=%d)",
@@ -312,9 +359,17 @@ class Agent:
         all_tool_calls: list[dict[str, Any]] = []
         all_tool_results: list[dict[str, Any]] = []
         max_rounds = 5
+        dispatch_ctx = _ToolDispatchContext(
+            task_id=task_id,
+            user_input=user_input,
+            local_tool_pool=self._create_local_tool_pool(),
+        )
 
         for _ in range(max_rounds):
-            tools = await self.get_tools_async(user_input)
+            tools = await self.get_tools_async(
+                user_input,
+                local_tool_pool=dispatch_ctx.local_tool_pool,
+            )
             prompt = backend.apply_chat_template(
                 self._messages,
                 tools=tools if tools else None,
@@ -339,6 +394,7 @@ class Agent:
                 # Record task finished (best-effort).
                 if self._tool_telemetry is not None:
                     try:
+                        self._export_local_tool_candidates(dispatch_ctx)
                         self._tool_telemetry.record_task_finished(task_id, self._session_id)
                     except Exception:
                         pass
@@ -353,7 +409,7 @@ class Agent:
             })
             all_tool_calls.extend(tool_calls)
 
-            tool_results = await self.execute_tools(tool_calls)
+            tool_results = await self.execute_tools(tool_calls, dispatch_ctx=dispatch_ctx)
             all_tool_results.extend(tool_results)
 
             for result in tool_results:
@@ -378,13 +434,18 @@ class Agent:
 
         if self._tool_telemetry is not None:
             try:
+                self._export_local_tool_candidates(dispatch_ctx)
                 self._tool_telemetry.record_task_finished(task_id, self._session_id)
             except Exception:
                 pass
 
         return fallback
 
-    async def execute_tools(self, tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    async def execute_tools(
+        self,
+        tool_calls: list[dict[str, Any]],
+        dispatch_ctx: _ToolDispatchContext | None = None,
+    ) -> list[dict[str, Any]]:
         """Execute tool calls and return results."""
         results: list[dict[str, Any]] = []
 
@@ -399,7 +460,7 @@ class Agent:
                 args = {}
 
             try:
-                content = await self._dispatch_tool(name, args)
+                content = await self._dispatch_tool(name, args, dispatch_ctx)
             except Exception as exc:
                 logger.exception("Tool %s raised an error", name)
                 content = f"工具调用失败: {exc}"
@@ -412,7 +473,11 @@ class Agent:
 
         return results
 
-    async def get_tools_async(self, query: str | None = None) -> list[dict[str, Any]]:
+    async def get_tools_async(
+        self,
+        query: str | None = None,
+        local_tool_pool: Any = None,
+    ) -> list[dict[str, Any]]:
         """Return tool definitions for the current turn.
 
         Mode ``legacy``: old assembled list.
@@ -433,28 +498,43 @@ class Agent:
 
         # Mode: all — return everything from registry.
         if mode == "all":
-            return registry.list_openai_tools()
+            return self._with_local_tools(registry.list_openai_tools(), local_tool_pool)
 
         # Mode: auto — decide based on tool count.
         if mode == "auto":
             all_tools = registry.list_tools()
             if len(all_tools) <= self._tool_retrieval_top_k:
-                return registry.list_openai_tools()
+                return self._with_local_tools(registry.list_openai_tools(), local_tool_pool)
             if query:
                 mode = "top_k"
             else:
-                return registry.list_openai_tools()
+                return self._with_local_tools(registry.list_openai_tools(), local_tool_pool)
 
         # Mode: top_k — semantic search with fallback.
         if mode == "top_k":
-            return await self._get_tools_top_k(query)
+            return self._with_local_tools(
+                await self._get_tools_top_k(query),
+                local_tool_pool,
+            )
 
         # Mode: hybrid — top_k + core tools.
         if mode == "hybrid":
-            return await self._get_tools_hybrid(query)
+            return self._with_local_tools(
+                await self._get_tools_hybrid(query),
+                local_tool_pool,
+            )
 
         # Fallback
-        return registry.list_openai_tools()
+        return self._with_local_tools(registry.list_openai_tools(), local_tool_pool)
+
+    def _with_local_tools(
+        self,
+        global_tools: list[dict[str, Any]],
+        local_tool_pool: Any = None,
+    ) -> list[dict[str, Any]]:
+        if local_tool_pool is None:
+            return global_tools
+        return local_tool_pool.list_openai_tools(global_tools)
 
     async def _get_tools_top_k(self, query: str | None) -> list[dict[str, Any]]:
         """Semantic search → keyword fallback → all."""
@@ -623,7 +703,12 @@ class Agent:
     # Tool dispatch
     # ------------------------------------------------------------------
 
-    async def _dispatch_tool(self, name: str, args: dict[str, Any]) -> str:
+    async def _dispatch_tool(
+        self,
+        name: str,
+        args: dict[str, Any],
+        dispatch_ctx: _ToolDispatchContext | None = None,
+    ) -> str:
         """Route a tool call.
 
         If the tool registry is active, dispatches via registry → router.
@@ -632,13 +717,19 @@ class Agent:
         """
         if self._use_tool_registry and self._tool_registry is not None:
             try:
-                from server.tools.spec import ToolContext, ToolRequest
+                from server.tools.spec import ToolContext
 
                 ctx = ToolContext(
                     session_id=self._session_id,
-                    user_input="",
+                    task_id=dispatch_ctx.task_id if dispatch_ctx else "",
+                    user_input=dispatch_ctx.user_input if dispatch_ctx else "",
                     model_name=self._current_model,
                 )
+                if dispatch_ctx and dispatch_ctx.local_tool_pool is not None:
+                    local_result = await dispatch_ctx.local_tool_pool.dispatch(name, args, ctx)
+                    if local_result.error_type != "tool_not_found":
+                        return local_result.content
+
                 result = await self._tool_registry.dispatch(name, args, ctx)
 
                 if result.error_type == "tool_not_found":
@@ -648,15 +739,11 @@ class Agent:
                     if self._is_integration_tool(name):
                         return await self._legacy_dispatch_tool(name, args)
 
-                    # Record a ToolRequest (dry-run — no auto-generation).
-                    req = ToolRequest(
-                        session_id=self._session_id,
-                        reason=f"Model requested tool '{name}' which does not exist",
-                        missing_capability=f"Tool '{name}' with args {json.dumps(args, ensure_ascii=False)[:200]}",
-                        candidate_name=name,
-                        candidate_description=f"Auto-detected need for tool: {name}",
-                        candidate_input_schema={"type": "object", "properties": {k: {"type": "string"} for k in args}},
-                    )
+                    req = self._build_tool_request(name, args, dispatch_ctx)
+                    generated = await self._try_in_situ_generation(req, args, ctx, dispatch_ctx)
+                    if generated is not None:
+                        return generated.content
+
                     if self._tool_telemetry is not None:
                         try:
                             self._tool_telemetry.record_tool_request(req)
@@ -674,6 +761,156 @@ class Agent:
 
         # Legacy path.
         return await self._legacy_dispatch_tool(name, args)
+
+    def _create_local_tool_pool(self) -> Any:
+        if self._tool_router is None:
+            return None
+        from server.tools.local_pool import LocalToolPool
+
+        return LocalToolPool(
+            router=self._tool_router,
+            sandbox_dir=self._tool_sandbox_dir,
+            global_registry=self._tool_registry,
+        )
+
+    def _build_tool_request(
+        self,
+        name: str,
+        args: dict[str, Any],
+        dispatch_ctx: _ToolDispatchContext | None,
+    ) -> Any:
+        from server.tools.spec import ToolRequest
+
+        return ToolRequest(
+            task_id=dispatch_ctx.task_id if dispatch_ctx else "",
+            session_id=self._session_id,
+            reason=f"Model requested tool '{name}' which does not exist",
+            missing_capability=f"Tool '{name}' with args {json.dumps(args, ensure_ascii=False)[:200]}",
+            candidate_name=name,
+            candidate_description=f"Auto-detected need for tool: {name}",
+            candidate_input_schema={
+                "type": "object",
+                "properties": {key: {"type": "string"} for key in args},
+                "required": list(args.keys()),
+            },
+            candidate_output_schema={"type": "object", "properties": {}},
+        )
+
+    async def _try_in_situ_generation(
+        self,
+        request: Any,
+        args: dict[str, Any],
+        ctx: Any,
+        dispatch_ctx: _ToolDispatchContext | None,
+    ) -> Any | None:
+        if not self._enable_in_situ_tool_generation:
+            return None
+        if dispatch_ctx is None or dispatch_ctx.local_tool_pool is None:
+            return None
+        if request.candidate_name in dispatch_ctx.attempted_generation:
+            return None
+        if (
+            self._tool_developer is None
+            or self._tool_verifier is None
+            or self._tool_risk_classifier is None
+        ):
+            return None
+
+        dispatch_ctx.attempted_generation.add(request.candidate_name)
+        decision = self._tool_risk_classifier.annotate_request(request)
+        if self._tool_telemetry is not None:
+            try:
+                self._tool_telemetry.record(
+                    "tool_generation_attempted",
+                    tool_name=request.candidate_name,
+                    task_id=request.task_id,
+                    session_id=request.session_id,
+                    metadata={
+                        "source": "in_situ_local",
+                        "risk_classifier": request.metadata.get("risk_classifier", {}),
+                    },
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to record generation attempt for '%s'",
+                    request.candidate_name,
+                    exc_info=True,
+                )
+
+        if not decision.auto_generatable:
+            return None
+
+        generation = await self._tool_developer.generate(request)
+        if not generation.get("success") or not generation.get("source_code"):
+            request.metadata["in_situ_generation"] = {
+                "success": False,
+                "error": generation.get("error"),
+            }
+            return None
+
+        source_code = generation["source_code"]
+        verify_result = self._tool_verifier.verify(request.candidate_name, source_code)
+        if not verify_result.passed:
+            request.metadata["in_situ_generation"] = {
+                "success": False,
+                "error": "; ".join(verify_result.errors),
+            }
+            return None
+
+        spec = self._build_generated_tool_spec(request)
+        dispatch_ctx.local_tool_pool.register(spec, source_code)
+        request.metadata["in_situ_generation"] = {"success": True}
+        if self._tool_telemetry is not None:
+            try:
+                self._tool_telemetry.record_tool_created(
+                    request.candidate_name,
+                    metadata={
+                        "source": "in_situ_local",
+                        "task_id": request.task_id,
+                        "session_id": request.session_id,
+                        "risk_classifier": request.metadata.get("risk_classifier", {}),
+                    },
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to record created generated tool '%s'",
+                    request.candidate_name,
+                    exc_info=True,
+                )
+        return await dispatch_ctx.local_tool_pool.dispatch(request.candidate_name, args, ctx)
+
+    def _build_generated_tool_spec(self, request: Any) -> Any:
+        from server.tools.spec import ToolRuntime, ToolSpec, ToolStatus
+
+        return ToolSpec(
+            name=request.candidate_name,
+            description=request.candidate_description or request.missing_capability,
+            input_schema=request.candidate_input_schema,
+            output_schema=request.candidate_output_schema,
+            runtime=ToolRuntime.PYTHON_GENERATED,
+            provider="query_local",
+            risk_level=request.risk_level,
+            status=ToolStatus.ACTIVE,
+            metadata={
+                "generated_from_tool_request": True,
+                "task_id": request.task_id,
+                "session_id": request.session_id,
+                **request.metadata,
+            },
+        )
+
+    def _export_local_tool_candidates(self, dispatch_ctx: _ToolDispatchContext | None) -> None:
+        if dispatch_ctx is None or dispatch_ctx.local_tool_pool is None:
+            return
+        if self._tool_local_candidate_exporter is None:
+            return
+        if not dispatch_ctx.local_tool_pool.list_specs():
+            return
+        self._tool_local_candidate_exporter.export(
+            dispatch_ctx.local_tool_pool,
+            task_id=dispatch_ctx.task_id,
+            batch_id=f"session_{self._session_id}",
+        )
 
     def _integration_error_for_tool(self, name: str) -> str:
         """Return a helpful error message when a tool belongs to a known integration."""

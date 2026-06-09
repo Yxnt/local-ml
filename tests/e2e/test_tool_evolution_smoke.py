@@ -1,4 +1,4 @@
-"""E2E smoke test: ToolRequest → Generate → Verify → Register → Execute → Promote → EGL.
+"""E2E smoke test: ToolRequest → Generate → Verify → Candidate → Promote → Execute → EGL.
 
 Uses a FakeToolDeveloper (no real LLM) and tmp_path isolation.
 """
@@ -125,7 +125,7 @@ def _make_registry(tmp_path: Path) -> tuple[ToolRegistry, TelemetryService, Tool
 
 
 class TestToolEvolutionSmoke:
-    """Full E2E: request → generate → verify → register → execute → promote → EGL."""
+    """Full E2E: request → generate → verify → candidate → promote → execute → EGL."""
 
     def test_full_pipeline(self, tmp_path):
         registry, telemetry, router = _make_registry(tmp_path)
@@ -174,8 +174,40 @@ class TestToolEvolutionSmoke:
         assert spec.status == ToolStatus.CANDIDATE
         assert spec.runtime == ToolRuntime.PYTHON_GENERATED
 
-        # 4. Execute the tool.
+        # 4. Candidate tools are not normal dispatch targets.
         ctx = ToolContext(session_id="sess_001", task_id="task_001")
+        candidate_result = asyncio.run(
+            registry.dispatch("text_count_words", {"text": "hello world"}, ctx)
+        )
+        assert not candidate_result.success
+        assert candidate_result.error_type == "tool_candidate"
+
+        # 5. Internal validation can still execute the candidate and record telemetry.
+        validation_result = asyncio.run(
+            router.dispatch(spec, {"text": "hello world"}, ctx)
+        )
+        assert validation_result.success, f"Validation failed: {validation_result.content}"
+        data = json.loads(validation_result.content)
+        assert data["count"] == 2, f"Expected count=2, got {data}"
+
+        # 6. Verify telemetry events.
+        events = telemetry.get_recent_events(limit=50)
+        event_types = {e["event_type"] for e in events}
+        assert "tool_request" in event_types
+        assert "tool_invoked" in event_types
+        assert "tool_succeeded" in event_types
+
+        # 7. Promote candidates (min_success_count=1, min_success_rate=1.0).
+        promote_result = orchestrator.promote_candidates(
+            min_success_count=1, min_success_rate=1.0
+        )
+        assert promote_result["promoted"] == 1, f"Expected 1 promoted, got {promote_result}"
+
+        # 8. Verify tool is now ACTIVE and normal dispatch works.
+        spec_after = registry.get_tool("text_count_words")
+        assert spec_after is not None
+        assert spec_after.status == ToolStatus.ACTIVE
+
         exec_result = asyncio.run(
             registry.dispatch("text_count_words", {"text": "hello world"}, ctx)
         )
@@ -183,25 +215,7 @@ class TestToolEvolutionSmoke:
         data = json.loads(exec_result.content)
         assert data["count"] == 2, f"Expected count=2, got {data}"
 
-        # 5. Verify telemetry events.
-        events = telemetry.get_recent_events(limit=50)
-        event_types = {e["event_type"] for e in events}
-        assert "tool_request" in event_types
-        assert "tool_invoked" in event_types
-        assert "tool_succeeded" in event_types
-
-        # 6. Promote candidates (min_success_count=1, min_success_rate=1.0).
-        promote_result = orchestrator.promote_candidates(
-            min_success_count=1, min_success_rate=1.0
-        )
-        assert promote_result["promoted"] == 1, f"Expected 1 promoted, got {promote_result}"
-
-        # 7. Verify tool is now ACTIVE.
-        spec_after = registry.get_tool("text_count_words")
-        assert spec_after is not None
-        assert spec_after.status == ToolStatus.ACTIVE
-
-        # 8. Verify EGL > 0.
+        # 9. Verify EGL > 0.
         metrics = ToolMetrics(registry=registry, telemetry=telemetry)
         egl = metrics.get_egl()
         assert egl is not None, "EGL should not be None"

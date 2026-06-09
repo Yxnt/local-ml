@@ -138,7 +138,8 @@ When the Executor path encounters a missing capability:
 2. Classify the requested capability with an explicit risk classifier
 3. Invoke the existing developer/verifier pipeline
 4. If verification passes, register the generated tool into a local pool for the current query/session
-5. Resume the interrupted execution with the augmented local pool
+5. Emit generation-attempt and generation-created telemetry for eval visibility
+6. Resume the interrupted execution with the augmented local pool
 
 The key idea is that new tools should become immediately usable for the current task without first being promoted into the durable global pool.
 
@@ -172,13 +173,20 @@ Generated source for local tools must be materialized in the sandbox used by `Ge
 
 Same-run retry must be bounded. A single missing tool should not trigger unbounded generate/retry loops; the first implementation should allow at most one in-situ synthesis attempt per missing tool name per task.
 
+At task completion, verified query-local tools should be exported as `CANDIDATE` absorber inputs, with their generated source and replay cases preserved. This is the handoff from per-query local pools `P_(t,i)` to the batch consolidation step. Candidate tools are not active global tools and must not be callable through normal registry dispatch; absorber can still read them through candidate-aware registry listing.
+
 ### Component Changes
 
 - `server/agent.py`
   - introduce a query-scoped local tool pool
   - allow missing-capability handling to trigger synthesis and retry/resume
+  - export verified local tools as candidate absorber inputs after task completion
 - local tool pool helper under `server/tools/`
   - support query-local lookup, listing, and dispatch layered over the global registry
+- local candidate helper under `server/tools/`
+  - persist query-local generated source/specs as CANDIDATE tools for absorber consolidation
+- tool registry dispatch path
+  - reject CANDIDATE tools in normal dispatch while leaving them visible to absorber listing
 - tool developer / verifier path
   - reuse existing generation and verification contracts instead of inventing a new generation stack
 
@@ -193,6 +201,7 @@ Same-run retry must be bounded. A single missing tool should not trigger unbound
 
 - A missing-capability query can generate a safe tool and finish within the same run
 - Generated tools become available immediately in the query-local pool
+- Verified local tools are exported as absorber candidates after the task, not promoted to active global tools
 - Unknown-risk requests remain request-only and are not auto-generated
 - Failure still degrades gracefully to recorded request plus normal failure path
 
@@ -337,7 +346,9 @@ General-purpose deterministic text/computation tasks are still preferred because
 ### PR A
 
 - Modify: `server/agent.py`
+- Modify: `server/tools/registry.py`
 - Modify: tool-registry lookup path to support query-local augmentation
+- Create: `server/tools/local_candidates.py`
 - Reuse: existing developer / verifier / generated execution stack
 
 ### PR B

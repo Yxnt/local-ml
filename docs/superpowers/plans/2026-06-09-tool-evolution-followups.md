@@ -552,11 +552,15 @@ async def test_dispatch_generates_safe_missing_tool_and_retries_locally(agent: A
         attempted_generation=set(),
     )
     created_events = []
+    generation_events = []
 
     async def missing_dispatch(name, args, tool_ctx):
         return ToolResult(content=f"未知工具: {name}", success=False, error_type="tool_not_found")
 
     agent._tool_registry.dispatch = missing_dispatch
+    agent._tool_telemetry.record = (
+        lambda event_type, **kw: generation_events.append((event_type, kw)) or 1
+    )
     agent._tool_telemetry.record_tool_created = (
         lambda name, version="", **kw: created_events.append((name, version, kw)) or 1
     )
@@ -566,6 +570,8 @@ async def test_dispatch_generates_safe_missing_tool_and_retries_locally(agent: A
     assert json.loads(content) == {"result": "cba"}
     assert (Path(agent._tool_sandbox_dir) / "text_reverse.py").exists()
     assert "text_reverse" in ctx.attempted_generation
+    assert generation_events[0][0] == "tool_generation_attempted"
+    assert generation_events[0][1]["metadata"]["source"] == "in_situ_local"
     assert created_events[0][0] == "text_reverse"
     assert created_events[0][2]["metadata"]["source"] == "in_situ_local"
 
@@ -874,6 +880,17 @@ async def _try_in_situ_generation(
 
     dispatch_ctx.attempted_generation.add(request.candidate_name)
     decision = self._tool_risk_classifier.annotate_request(request)
+    if self._tool_telemetry is not None:
+        self._tool_telemetry.record(
+            "tool_generation_attempted",
+            tool_name=request.candidate_name,
+            task_id=request.task_id,
+            session_id=request.session_id,
+            metadata={
+                "source": "in_situ_local",
+                "risk_classifier": request.metadata.get("risk_classifier", {}),
+            },
+        )
     if not decision.auto_generatable:
         return None
 
@@ -933,7 +950,9 @@ def _build_generated_tool_spec(self, request: Any) -> Any:
 
 - [ ] **Step 11: Ensure blocked, failed, and successful generation are visible in telemetry**
 
-Inside `_try_in_situ_generation`, after classifier annotation and before returning for blocked requests, do not record telemetry there. Keep the single `record_tool_request(req)` call in `_dispatch_tool` after `_try_in_situ_generation()` returns `None`; this ensures both blocked and failed generation attempts retain classifier metadata.
+Inside `_try_in_situ_generation`, after classifier annotation, emit a generic `tool_generation_attempted` event with `metadata["source"] == "in_situ_local"` and the classifier decision. This event is the denominator for `in_situ_generation_success_rate`.
+
+Keep the single `record_tool_request(req)` call in `_dispatch_tool` after `_try_in_situ_generation()` returns `None`; this ensures blocked and failed generation attempts retain classifier metadata and current missing-tool behavior.
 
 For successful local generation, do not mutate the durable global registry in PR A, but do emit `record_tool_created()` with `metadata["source"] == "in_situ_local"` and the classifier decision. PR C uses this event to compute `evolution_growth_level`; without it, successful query-local generation is invisible to the eval harness.
 
@@ -964,6 +983,7 @@ git commit -m "feat: enable optional in-situ tool generation"
 - Create: `server/tools/local_candidates.py`
 - Create: `tests/tools/test_local_candidates.py`
 - Modify: `server/agent.py`
+- Modify: `server/tools/registry.py`
 - Modify: `server/tools/__init__.py`
 
 - [ ] **Step 1: Write failing candidate export tests**
@@ -1062,11 +1082,42 @@ def test_export_skips_names_that_already_exist_in_registry(tmp_path: Path):
     assert exported == []
 ```
 
+Add a registry guard test to the existing registry test module. If the repo does not already have a focused registry test file, create `tests/tools/test_registry_candidate_dispatch.py`:
+
+```python
+import pytest
+
+from server.tools.registry import ToolRegistry
+from server.tools.spec import RiskLevel, ToolContext, ToolRuntime, ToolSpec, ToolStatus
+
+
+@pytest.mark.asyncio
+async def test_candidate_tool_is_not_dispatchable(tmp_path):
+    registry = ToolRegistry(db_path=str(tmp_path / "tools.db"))
+    registry.connect()
+    registry.register(
+        ToolSpec(
+            name="candidate_reverse",
+            description="Candidate only",
+            input_schema={"type": "object", "properties": {}},
+            runtime=ToolRuntime.PYTHON_GENERATED,
+            provider="query_local_candidate",
+            risk_level=RiskLevel.L0,
+            status=ToolStatus.CANDIDATE,
+        )
+    )
+
+    result = await registry.dispatch("candidate_reverse", {}, ToolContext())
+
+    assert result.success is False
+    assert result.error_type == "tool_candidate"
+```
+
 - [ ] **Step 2: Run the test and verify it fails because the module is absent**
 
-Run: `python -m pytest tests/tools/test_local_candidates.py -q`
+Run: `python -m pytest tests/tools/test_local_candidates.py tests/tools/test_registry_candidate_dispatch.py -q`
 
-Expected: FAIL with `ModuleNotFoundError: No module named 'server.tools.local_candidates'`.
+Expected: FAIL with `ModuleNotFoundError: No module named 'server.tools.local_candidates'` for the exporter test, and FAIL on the candidate dispatch test because current registry dispatch can execute a lone CANDIDATE spec.
 
 - [ ] **Step 3: Implement candidate exporter**
 
@@ -1140,7 +1191,22 @@ class LocalCandidateExporter:
         return exported
 ```
 
-- [ ] **Step 4: Export type from `server/tools/__init__.py`**
+- [ ] **Step 4: Prevent normal dispatch of candidate tools**
+
+Modify `server/tools/registry.py` so `ToolStatus.CANDIDATE` is visible to absorber queries but not callable through normal dispatch:
+
+```python
+if spec.status == ToolStatus.CANDIDATE:
+    return ToolResult(
+        content=f"工具尚未激活: {name}",
+        success=False,
+        error_type="tool_candidate",
+    )
+```
+
+Add this check in `dispatch()` after the existing `DEPRECATED` and `BLOCKED` checks. Keep `list_tools(status=None)` unchanged because absorber uses it to find ACTIVE and CANDIDATE specs.
+
+- [ ] **Step 5: Export type from `server/tools/__init__.py`**
 
 Add:
 
@@ -1150,7 +1216,7 @@ from server.tools.local_candidates import LocalCandidateExporter
 
 and include `"LocalCandidateExporter"` in `__all__`.
 
-- [ ] **Step 5: Wire optional export at Agent task finish**
+- [ ] **Step 6: Wire optional export at Agent task finish**
 
 Modify `Agent.__init__` to accept:
 
@@ -1196,22 +1262,22 @@ if (
 
 Apply this to the normal no-more-tool-calls return path and the max-rounds fallback path. Keep exported tools as `ToolStatus.CANDIDATE`; they are batch absorption inputs, not immediately promoted global tools.
 
-- [ ] **Step 6: Run candidate export tests**
+- [ ] **Step 7: Run candidate export and guard tests**
 
-Run: `python -m pytest tests/tools/test_local_candidates.py -q`
+Run: `python -m pytest tests/tools/test_local_candidates.py tests/tools/test_registry_candidate_dispatch.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 7: Run Agent generation test again**
+- [ ] **Step 8: Run Agent generation test again**
 
 Run: `python -m pytest tests/server/test_agent_in_situ_generation.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add server/tools/local_candidates.py tests/tools/test_local_candidates.py server/tools/__init__.py server/agent.py
+git add server/tools/local_candidates.py tests/tools/test_local_candidates.py tests/tools/test_registry_candidate_dispatch.py server/tools/__init__.py server/tools/registry.py server/agent.py
 git commit -m "feat: export local generated tools as candidates"
 ```
 
@@ -1331,7 +1397,17 @@ async def test_absorber_replay_cases_block_incompatible_merge(registry, telemetr
 
 The important test detail is that this uses existing `registry`, `telemetry`, `sandbox_dir`, `_register_two_similar_tools()`, `FakeVerifier`, `MERGED_SOURCE`, and `_make_fake_remote_generate()` symbols from the file. Do not add new test-stack helpers when the existing fixtures already provide the needed registry, telemetry, and sandbox.
 
-Update the existing `_register_two_similar_tools()` helper to accept replay cases and attach them before registration:
+Update the existing `_register_two_similar_tools()` helper to accept replay cases. Change the signature from:
+
+```python
+def _register_two_similar_tools(
+    registry: ToolRegistry,
+    sandbox_dir: str,
+    embedding_dim: int = 768,
+) -> tuple[ToolSpec, ToolSpec]:
+```
+
+to:
 
 ```python
 def _register_two_similar_tools(
@@ -1341,17 +1417,15 @@ def _register_two_similar_tools(
     replay_cases_a: list[dict[str, Any]] | None = None,
     replay_cases_b: list[dict[str, Any]] | None = None,
 ) -> tuple[ToolSpec, ToolSpec]:
-    ...
-    spec_a = ToolSpec(...)
-    spec_b = ToolSpec(...)
-    if replay_cases_a:
-        spec_a.metadata["replay_cases"] = replay_cases_a
-    if replay_cases_b:
-        spec_b.metadata["replay_cases"] = replay_cases_b
+```
 
-    registry.register(spec_a)
-    registry.register(spec_b)
-    return spec_a, spec_b
+Then insert this block immediately before the existing `registry.register(spec_a)` call:
+
+```python
+if replay_cases_a:
+    spec_a.metadata["replay_cases"] = replay_cases_a
+if replay_cases_b:
+    spec_b.metadata["replay_cases"] = replay_cases_b
 ```
 
 - [ ] **Step 2: Run the new absorber tests and verify replay is not enforced**
@@ -1458,7 +1532,7 @@ When constructing `merged_spec.metadata`, add:
 "replay_case_count": len(self._collect_replay_cases(cluster)),
 ```
 
-If this repeats collection in the code, assign `replay_cases = self._collect_replay_cases(cluster)` before `merged_spec = ToolSpec(...)` and reuse that variable.
+If this repeats collection in the code, assign `replay_cases = self._collect_replay_cases(cluster)` immediately before constructing `merged_spec` and reuse that variable.
 
 - [ ] **Step 6: Run absorber tests**
 
@@ -1878,8 +1952,9 @@ generated_tools_created = sum(
     if _metadata(row).get("source") in {"in_situ_local", "absorber"}
 )
 in_situ_generation_attempted = any(
-    _metadata(row).get("risk_classifier", {}).get("auto_generatable") is not None
-    for row in requests
+    row.get("event_type") == "tool_generation_attempted"
+    and _metadata(row).get("source") == "in_situ_local"
+    for row in events
 )
 in_situ_generation_success = any(
     _metadata(row).get("source") == "in_situ_local"
@@ -1892,7 +1967,7 @@ warm_start_reused_generated_tool = (
 )
 ```
 
-If telemetry metadata is stored as JSON text in `requests`, parse it with `json.loads()` before accessing nested fields.
+If telemetry metadata is stored as JSON text in telemetry rows, parse it with `json.loads()` before accessing nested fields.
 
 Add fields to the result dict:
 

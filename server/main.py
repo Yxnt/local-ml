@@ -7,6 +7,8 @@ from pydantic import BaseModel
 from typing import List, Optional, Literal
 
 from backends import ModelRegistry
+from personal_evolution.store import PersonalEvolutionStore
+from server.personal_evolution_api import mount_personal_evolution_app
 from server.websocket import handle_websocket
 
 # ====== Pydantic request types (for FastAPI validation) ======
@@ -33,6 +35,10 @@ app = FastAPI(title="Local ML Service")
 
 # Register WebSocket endpoint
 handle_websocket(app, registry)
+personal_evolution_store = PersonalEvolutionStore(
+    os.environ.get("PERSONAL_EVOLUTION_DB", "memory/personal_evolution.sqlite3")
+)
+mount_personal_evolution_app(app, store=personal_evolution_store)
 
 
 @app.get("/v1/models")

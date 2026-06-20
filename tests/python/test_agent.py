@@ -14,6 +14,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from backends.base import ModelBackend
+from personal_evolution.models import ApprovedMemory, MemoryStatus, MemoryType
+from personal_evolution.store import PersonalEvolutionStore
 
 
 # ---------------------------------------------------------------------------
@@ -225,9 +227,49 @@ class TestSystemPrompt:
     def test_system_prompt_set_on_first_run(self, agent):
         """First call to run() should insert a system message."""
         import asyncio
-        response = asyncio.get_event_loop().run_until_complete(agent.run("Hi"))
+        response = asyncio.run(agent.run("Hi"))
         assert agent._messages[0]["role"] == "system"
         assert len(agent._messages[0]["content"]) > 0
+
+    def test_system_prompt_includes_approved_personal_evolution_memories(
+        self,
+        tmp_data_dir,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Approved personal memories should be available to the local model."""
+        db_path = tmp_path / "personal.sqlite3"
+        store = PersonalEvolutionStore(db_path)
+        store.save_approved_memory(
+            ApprovedMemory(
+                memory_id="mem-active",
+                memory_type=MemoryType.EVENT,
+                content="The user prefers audit-first local learning.",
+                evidence_ids=["ev-1"],
+                candidate_id="cand-1",
+                version=1,
+                confidence=0.8,
+                status=MemoryStatus.APPROVED,
+                approved_at="2026-06-20T09:04:00+00:00",
+                revoked_at=None,
+            )
+        )
+        monkeypatch.setenv("PERSONAL_EVOLUTION_DB", str(db_path))
+
+        with patch("server.agent.ModelRegistry") as MockRegistry, \
+             patch("server.agent.EmbeddingClient"):
+            mock_reg = MockRegistry.return_value
+            mock_reg.get_backend.return_value = StubBackend()
+            mock_reg.get_or_load = AsyncMock(return_value=StubBackend())
+
+            from server.agent import Agent
+
+            a = Agent(data_dir=tmp_data_dir, default_model="gemma-4-e2b-it-4bit")
+
+        prompt = a._build_system_prompt()
+
+        assert "已确认的个人长期记忆" in prompt
+        assert "audit-first local learning" in prompt
 
 
 # ---------------------------------------------------------------------------

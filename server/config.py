@@ -109,12 +109,24 @@ class EmailConfig(BaseModel):
     accounts: dict[str, EmailAccount] = Field(default_factory=dict)
 
 
+class PhotosConfig(BaseModel):
+    """Apple Photos integration config."""
+
+    enabled: bool = False
+    photos_library: str = "~/Pictures/Photos Library.photoslibrary"
+    db_path: str = "memory/photos.db"
+    vlm_model: str = "minicpm-v-4.6"
+    cache_analyses: bool = True
+    max_results: int = 20
+
+
 class IntegrationsConfig(BaseModel):
     """All third-party integrations."""
 
     obsidian: ObsidianConfig = Field(default_factory=ObsidianConfig)
     calendar: CalendarConfig = Field(default_factory=CalendarConfig)
     email: EmailConfig = Field(default_factory=EmailConfig)
+    photos: PhotosConfig = Field(default_factory=PhotosConfig)
 
 
 class OptimizationConfig(BaseModel):
@@ -164,6 +176,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "obsidian": {"vaults": {}},
         "calendar": {"accounts": {}},
         "email": {"accounts": {}},
+        "photos": {},
     },
     "optimization": {
         "auto_train_threshold": 50,

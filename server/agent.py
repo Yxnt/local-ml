@@ -27,6 +27,8 @@ if _PROJECT_ROOT not in sys.path:
 from backends.registry import ModelRegistry
 from memory.manager import MemoryManager
 from optimization.collector import UsageCollector, Outcome
+from personal_evolution.context import build_approved_memory_context
+from personal_evolution.store import PersonalEvolutionStore
 from server.context_manager import ContextManager
 from server.embedding_client import EmbeddingClient
 
@@ -271,6 +273,10 @@ class Agent:
         if memory_prompt:
             parts.append(memory_prompt)
 
+        personal_memory_prompt = self._build_personal_evolution_prompt()
+        if personal_memory_prompt:
+            parts.append(personal_memory_prompt)
+
         # Contextual entities and recent history.
         context_info = self._context.get_relevant_context("")
         if context_info:
@@ -282,6 +288,18 @@ class Agent:
             parts.append(f"\n已连接的数据源：{', '.join(connected)}")
 
         return "\n\n".join(parts)
+
+    def _build_personal_evolution_prompt(self) -> str:
+        db_path = os.environ.get("PERSONAL_EVOLUTION_DB")
+        if not db_path:
+            db_path = os.path.join(self._data_dir, "personal_evolution.sqlite3")
+        if not os.path.exists(db_path):
+            return ""
+        try:
+            return build_approved_memory_context(PersonalEvolutionStore(db_path))
+        except Exception:
+            logger.warning("Failed to load personal evolution memories", exc_info=True)
+            return ""
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -617,10 +635,9 @@ class Agent:
                 return self._tool_registry.list_openai_tools()
             return self._legacy_get_tools()
 
-        # No running loop — safe to run_until_complete.
-        return asyncio.get_event_loop().run_until_complete(
-            self.get_tools_async(query)
-        )
+        # No running loop: create a short-lived loop explicitly. Python 3.12 no
+        # longer guarantees a current loop exists in synchronous test callers.
+        return asyncio.run(self.get_tools_async(query))
 
     def _legacy_get_tools(self) -> list[dict[str, Any]]:
         """Original get_tools logic — assembled from components."""

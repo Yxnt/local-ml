@@ -230,6 +230,37 @@ def test_models_defensively_copy_mutable_inputs() -> None:
         event.evidence_ids.append("ev-photo-2")
 
 
+def test_audit_event_defensively_copies_snapshot_inputs() -> None:
+    before = {"status": "pending", "evidence_ids": ["ev-photo-1"]}
+    after = {"status": "approved", "evidence_ids": ["ev-photo-1"]}
+
+    audit = AuditEvent(
+        audit_id="audit-1",
+        entity_type="candidate",
+        entity_id="cand-1",
+        action=AuditAction.APPROVED,
+        actor="user",
+        before=before,
+        after=after,
+        reason="Looks right",
+        created_at="2026-06-20T09:04:00",
+    )
+
+    before["status"] = "rejected"
+    before["evidence_ids"].append("ev-photo-2")
+    after["status"] = "revoked"
+    after["evidence_ids"].append("ev-photo-2")
+
+    assert audit.to_dict()["before"] == {
+        "status": "pending",
+        "evidence_ids": ["ev-photo-1"],
+    }
+    assert audit.to_dict()["after"] == {
+        "status": "approved",
+        "evidence_ids": ["ev-photo-1"],
+    }
+
+
 def test_candidate_from_dict_parses_remote_assisted_false_string() -> None:
     candidate = CandidateMemory.from_dict(
         {

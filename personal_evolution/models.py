@@ -232,6 +232,12 @@ class AuditEvent:
     reason: str | None
     created_at: str
 
+    def __post_init__(self) -> None:
+        if self.before is not None:
+            object.__setattr__(self, "before", _freeze(self.before))
+        if self.after is not None:
+            object.__setattr__(self, "after", _freeze(self.after))
+
     def to_dict(self) -> dict[str, Any]:
         return _json_safe_dict(self)
 

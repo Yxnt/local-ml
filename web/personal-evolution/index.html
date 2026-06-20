@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Personal Evolution Review</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Personal evolution</p>
+          <h1>Review console</h1>
+        </div>
+        <label class="date-control">
+          <span>Review date</span>
+          <input id="review-date" type="date">
+        </label>
+      </header>
+
+      <section class="panel" aria-labelledby="review-heading">
+        <div class="panel-header">
+          <h2 id="review-heading">Review Today/Week</h2>
+          <button id="refresh-review" type="button">Refresh</button>
+        </div>
+        <div id="review-summary" class="summary-grid" aria-live="polite"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="queue-heading">
+        <div class="panel-header">
+          <h2 id="queue-heading">Learning Queue</h2>
+          <span id="candidate-count" class="meta">0 candidates</span>
+        </div>
+        <div id="candidate-list" class="list" aria-live="polite"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="ledger-heading">
+        <div class="panel-header">
+          <h2 id="ledger-heading">Memory Ledger</h2>
+          <span id="memory-count" class="meta">0 memories</span>
+        </div>
+        <div id="memory-list" class="list" aria-live="polite"></div>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

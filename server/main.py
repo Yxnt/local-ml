@@ -1,12 +1,15 @@
 import json
 import os
 import uvicorn
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional, Literal
 
 from backends import ModelRegistry
+from personal_evolution.store import PersonalEvolutionStore
+from server.personal_evolution_api import mount_personal_evolution_app
 from server.websocket import handle_websocket
 
 # ====== Pydantic request types (for FastAPI validation) ======
@@ -33,6 +36,13 @@ app = FastAPI(title="Local ML Service")
 
 # Register WebSocket endpoint
 handle_websocket(app, registry)
+default_personal_evolution_db = (
+    Path(__file__).resolve().parents[1] / "memory" / "personal_evolution.sqlite3"
+)
+personal_evolution_store = PersonalEvolutionStore(
+    os.environ.get("PERSONAL_EVOLUTION_DB", str(default_personal_evolution_db))
+)
+mount_personal_evolution_app(app, store=personal_evolution_store)
 
 
 @app.get("/v1/models")

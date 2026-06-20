@@ -92,7 +92,7 @@ def _source_types_for_event(
             if evidence_id in evidence_by_id
         }
     )
-    return ", ".join(source_types)
+    return ", ".join(source_types) if source_types else "local signals"
 
 
 def _stable_id(prefix: str, *parts: str) -> str:

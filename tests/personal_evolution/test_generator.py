@@ -11,6 +11,7 @@ from personal_evolution.ingestors import (
     PhotoSummaryIngestor,
 )
 from personal_evolution.models import MemoryStatus, MemoryType
+from personal_evolution.models import ObservedEvent
 
 
 def test_observed_event_builder_groups_evidence_by_day() -> None:
@@ -123,3 +124,22 @@ def test_observed_event_builder_creates_one_event_per_day() -> None:
         "Personal signals for 2026-06-20",
         "Personal signals for 2026-06-21",
     ]
+
+
+def test_candidate_generator_falls_back_when_event_sources_are_missing() -> None:
+    event = ObservedEvent(
+        event_id="event-missing-source",
+        start_at="2026-06-20T09:00:00",
+        end_at="2026-06-20T09:00:00",
+        title="Personal signals for 2026-06-20",
+        summary="Coffee and laptop on a desk",
+        evidence_ids=["missing-evidence-id"],
+        confidence=0.65,
+        created_at="2026-06-20T09:01:00",
+    )
+
+    candidate = CandidateMemoryGenerator().generate([event], evidence=[])[0]
+
+    assert "local signals" in candidate.claim
+    assert "from  indicated" not in candidate.claim
+    assert "  " not in candidate.claim

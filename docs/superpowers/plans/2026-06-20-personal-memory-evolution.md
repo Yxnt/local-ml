@@ -29,25 +29,25 @@ This plan does not implement real Apple Health permissions, full Calendar ingest
 
 Create:
 
-- `personal_evolution/__init__.py`  
+- `personal_evolution/__init__.py`
   Public package exports.
-- `personal_evolution/models.py`  
+- `personal_evolution/models.py`
   Dataclasses, enums, JSON serialization helpers, and validation for personal evolution records.
-- `personal_evolution/store.py`  
+- `personal_evolution/store.py`
   SQLite persistence for evidence, observed events, candidates, approved memories, and audit events.
-- `personal_evolution/ingestors.py`  
+- `personal_evolution/ingestors.py`
   Mock-friendly source ingestors and normalized source summary types.
-- `personal_evolution/generator.py`  
+- `personal_evolution/generator.py`
   Deterministic observed-event and candidate-memory generation from source summaries.
-- `personal_evolution/review.py`  
+- `personal_evolution/review.py`
   Review workflow service that enforces state transitions and audit logging.
-- `server/personal_evolution_api.py`  
+- `server/personal_evolution_api.py`
   FastAPI router factory for review period, candidate queue, approve/edit/reject/revoke, memory ledger, evidence, and audit endpoints.
-- `web/personal-evolution/index.html`  
+- `web/personal-evolution/index.html`
   Static review console shell.
-- `web/personal-evolution/styles.css`  
+- `web/personal-evolution/styles.css`
   Responsive review console styling.
-- `web/personal-evolution/app.js`  
+- `web/personal-evolution/app.js`
   Browser-side API calls and UI state handling.
 - `tests/personal_evolution/test_models.py`
 - `tests/personal_evolution/test_store.py`
@@ -60,7 +60,7 @@ Create:
 
 Modify:
 
-- `server/main.py`  
+- `server/main.py`
   Include the personal evolution API router and mount the static app.
 
 ## Task 1: Models And Serialization

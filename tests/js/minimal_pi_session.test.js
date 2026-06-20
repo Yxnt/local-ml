@@ -14,7 +14,7 @@ test("createLocalPiSession uses a minimal prompt and a single bash tool", async 
     assert.ok(session.systemPrompt.startsWith(SYSTEM_PROMPT));
     assert.ok(!session.systemPrompt.includes("<available_skills>"));
     assert.ok(session.systemPrompt.includes("Current date:"));
-    assert.ok(session.systemPrompt.includes("Current working directory: /Users/yxn/Github/local-ml"));
+    assert.ok(session.systemPrompt.includes(`Current working directory: ${process.cwd()}`));
   } finally {
     session.dispose();
   }

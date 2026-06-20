@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+import sys
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -139,3 +141,31 @@ def test_api_candidates_rejects_invalid_status(tmp_path: Path) -> None:
 
     assert response.status_code == 400
     assert response.json()["detail"] == "Invalid candidate status: unknown"
+
+
+def test_main_import_does_not_create_default_db_under_process_cwd(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    env_db_path = tmp_path / "env" / "personal.sqlite3"
+    cwd_memory_db_path = tmp_path / "memory" / "personal_evolution.sqlite3"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PERSONAL_EVOLUTION_DB", str(env_db_path))
+
+    main_module = importlib.import_module("server.main")
+    main_module = importlib.reload(main_module)
+    routes = sorted(route.path for route in main_module.app.routes)
+
+    assert "/personal-evolution/review/{date}" in routes
+    assert "/personal-evolution/candidates" in routes
+    assert env_db_path.exists()
+    assert not cwd_memory_db_path.exists()
+
+    monkeypatch.delenv("PERSONAL_EVOLUTION_DB")
+    sys.modules.pop("server.main", None)
+    main_module = importlib.import_module("server.main")
+    routes = sorted(route.path for route in main_module.app.routes)
+
+    assert "/personal-evolution/review/{date}" in routes
+    assert "/personal-evolution/candidates" in routes
+    assert not cwd_memory_db_path.exists()

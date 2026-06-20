@@ -61,6 +61,25 @@ def test_obsidian_ingestor_extracts_title_and_hash_without_full_body(
     assert "audit-first" not in evidence.metadata
 
 
+def test_obsidian_ingestor_ignores_frontmatter_when_extracting_title(
+    tmp_path: Path,
+) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    note = vault / "Daily.md"
+    note.write_text(
+        "---\n# Private frontmatter comment\nowner: user\n---\n\nVisible body.\n",
+        encoding="utf-8",
+    )
+
+    evidence = ObsidianVaultIngestor(vault).ingest()[0]
+
+    assert evidence.summary == "Daily: Visible body."
+    assert evidence.metadata["title"] == "Daily"
+    assert "Private frontmatter comment" not in evidence.summary
+    assert "Private frontmatter comment" not in evidence.metadata["title"]
+
+
 def test_health_ingestor_uses_daily_aggregate_summary() -> None:
     ingestor = HealthSummaryIngestor(
         [

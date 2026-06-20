@@ -163,8 +163,7 @@ def _redact_local_path(summary: str, local_path: str | None) -> str:
 
 
 def _extract_title(path: Path, content: str) -> str:
-    for line in content.splitlines():
-        stripped = line.strip()
+    for stripped in _visible_markdown_lines(content):
         if stripped.startswith("# "):
             title = stripped[2:].strip()
             if title:
@@ -173,15 +172,20 @@ def _extract_title(path: Path, content: str) -> str:
 
 
 def _first_body_sentence(content: str) -> str:
-    in_frontmatter = False
-    for line in content.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped == "---":
-            in_frontmatter = not in_frontmatter
-            continue
-        if in_frontmatter or stripped.startswith("#"):
+    for stripped in _visible_markdown_lines(content):
+        if stripped.startswith("#"):
             continue
         return stripped
     return ""
+
+
+def _visible_markdown_lines(content: str) -> list[str]:
+    lines = content.splitlines()
+    start_index = 0
+    if lines and lines[0].strip() == "---":
+        for index, line in enumerate(lines[1:], start=1):
+            if line.strip() == "---":
+                start_index = index + 1
+                break
+
+    return [line.strip() for line in lines[start_index:] if line.strip()]

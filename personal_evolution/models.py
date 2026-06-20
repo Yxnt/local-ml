@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, fields
 from datetime import UTC, datetime
 from enum import Enum
+from types import MappingProxyType
 from typing import Any
 
 
@@ -48,9 +49,39 @@ def _enum_value(value: Any) -> Any:
     return value.value if isinstance(value, Enum) else value
 
 
+def _freeze(value: Any) -> Any:
+    if isinstance(value, MappingProxyType):
+        return value
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, list | tuple):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
+def _json_safe(value: Any) -> Any:
+    value = _enum_value(value)
+    if isinstance(value, MappingProxyType | dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, tuple | list):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 def _json_safe_dict(obj: Any) -> dict[str, Any]:
-    data = asdict(obj)
-    return {key: _enum_value(value) for key, value in data.items()}
+    return {field.name: _json_safe(getattr(obj, field.name)) for field in fields(obj)}
+
+
+def _parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    return bool(value)
 
 
 @dataclass(frozen=True)
@@ -65,6 +96,9 @@ class Evidence:
     metadata: dict[str, Any]
     created_at: str
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", _freeze(self.metadata))
+
     def to_dict(self) -> dict[str, Any]:
         return _json_safe_dict(self)
 
@@ -78,7 +112,7 @@ class Evidence:
             summary=data["summary"],
             sensitivity=data["sensitivity"],
             content_hash=data["content_hash"],
-            metadata=dict(data.get("metadata", {})),
+            metadata=data["metadata"],
             created_at=data["created_at"],
         )
 
@@ -94,6 +128,9 @@ class ObservedEvent:
     confidence: float
     created_at: str
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "evidence_ids", _freeze(self.evidence_ids))
+
     def to_dict(self) -> dict[str, Any]:
         return _json_safe_dict(self)
 
@@ -105,7 +142,7 @@ class ObservedEvent:
             end_at=data["end_at"],
             title=data["title"],
             summary=data["summary"],
-            evidence_ids=list(data.get("evidence_ids", [])),
+            evidence_ids=data["evidence_ids"],
             confidence=float(data["confidence"]),
             created_at=data["created_at"],
         )
@@ -125,6 +162,9 @@ class CandidateMemory:
     created_at: str
     updated_at: str
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "evidence_ids", _freeze(self.evidence_ids))
+
     def to_dict(self) -> dict[str, Any]:
         return _json_safe_dict(self)
 
@@ -135,11 +175,11 @@ class CandidateMemory:
             memory_type=MemoryType(data["memory_type"]),
             claim=data["claim"],
             rationale=data["rationale"],
-            evidence_ids=list(data.get("evidence_ids", [])),
+            evidence_ids=data["evidence_ids"],
             status=MemoryStatus(data["status"]),
             confidence=float(data["confidence"]),
             source_model=data["source_model"],
-            remote_assisted=bool(data["remote_assisted"]),
+            remote_assisted=_parse_bool(data["remote_assisted"]),
             created_at=data["created_at"],
             updated_at=data["updated_at"],
         )
@@ -158,6 +198,9 @@ class ApprovedMemory:
     approved_at: str
     revoked_at: str | None
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "evidence_ids", _freeze(self.evidence_ids))
+
     def to_dict(self) -> dict[str, Any]:
         return _json_safe_dict(self)
 
@@ -167,7 +210,7 @@ class ApprovedMemory:
             memory_id=data["memory_id"],
             memory_type=MemoryType(data["memory_type"]),
             content=data["content"],
-            evidence_ids=list(data.get("evidence_ids", [])),
+            evidence_ids=data["evidence_ids"],
             candidate_id=data["candidate_id"],
             version=int(data["version"]),
             confidence=float(data["confidence"]),

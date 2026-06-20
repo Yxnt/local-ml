@@ -177,12 +177,8 @@ class TestWebSocketAgent:
         session = agent.get_or_create_session("test-session")
 
         # Simulate two turns
-        asyncio.get_event_loop().run_until_complete(
-            agent.process_text("Hello", session)
-        )
-        asyncio.get_event_loop().run_until_complete(
-            agent.process_text("How are you?", session)
-        )
+        asyncio.run(agent.process_text("Hello", session))
+        asyncio.run(agent.process_text("How are you?", session))
 
         # Should have 4 messages: user1, assistant1, user2, assistant2
         assert len(session.messages) == 4

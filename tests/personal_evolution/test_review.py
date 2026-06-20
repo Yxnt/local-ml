@@ -4,9 +4,10 @@ from pathlib import Path
 
 import pytest
 
+import personal_evolution.review as review_module
 from personal_evolution.generator import CandidateMemoryGenerator, ObservedEventBuilder
 from personal_evolution.ingestors import PhotoSummary, PhotoSummaryIngestor
-from personal_evolution.models import AuditAction, CandidateMemory, MemoryStatus
+from personal_evolution.models import AuditAction, AuditEvent, CandidateMemory, MemoryStatus
 from personal_evolution.review import ReviewWorkflow, ReviewWorkflowError
 from personal_evolution.store import PersonalEvolutionStore
 
@@ -53,9 +54,14 @@ def test_approve_candidate_creates_approved_memory_and_audit(tmp_path: Path) -> 
     assert memory.evidence_ids == candidate.evidence_ids
     assert memory.revoked_at is None
     assert store.get_candidate(candidate.candidate_id).status == MemoryStatus.APPROVED
-    assert [
-        event.action for event in store.list_audit_events(candidate.candidate_id)
-    ] == [AuditAction.APPROVED]
+    audit_events = store.list_audit_events(candidate.candidate_id)
+    assert [event.action for event in audit_events] == [AuditAction.APPROVED]
+    assert audit_events[0].actor == "user"
+    assert audit_events[0].reason == "Looks right"
+    assert audit_events[0].before["status"] == MemoryStatus.PENDING.value
+    assert audit_events[0].after["status"] == MemoryStatus.APPROVED.value
+    assert audit_events[0].before["claim"] == candidate.claim
+    assert audit_events[0].after["claim"] == candidate.claim
 
 
 def test_edit_and_approve_uses_edited_content(tmp_path: Path) -> None:
@@ -71,9 +77,15 @@ def test_edit_and_approve_uses_edited_content(tmp_path: Path) -> None:
 
     assert memory.content == edited_content
     assert store.get_candidate(candidate.candidate_id).claim == edited_content
-    assert [
-        event.action for event in store.list_audit_events(candidate.candidate_id)
-    ] == [AuditAction.CANDIDATE_EDITED, AuditAction.APPROVED]
+    audit_events = store.list_audit_events(candidate.candidate_id)
+    assert [event.action for event in audit_events] == [
+        AuditAction.CANDIDATE_EDITED,
+        AuditAction.APPROVED,
+    ]
+    assert audit_events[0].before["claim"] == candidate.claim
+    assert audit_events[0].after["claim"] == edited_content
+    assert audit_events[1].before["claim"] == edited_content
+    assert audit_events[1].after["status"] == MemoryStatus.APPROVED.value
 
 
 def test_reject_candidate_blocks_later_approval(tmp_path: Path) -> None:
@@ -106,9 +118,57 @@ def test_revoke_memory_preserves_approved_record_and_adds_audit(tmp_path: Path) 
     assert revoked.status == MemoryStatus.REVOKED
     assert revoked.revoked_at is not None
     assert store.get_approved_memory(memory.memory_id) == revoked
+    audit_events = store.list_audit_events(memory.memory_id)
+    assert [event.action for event in audit_events] == [AuditAction.REVOKED]
+    assert audit_events[0].before["status"] == MemoryStatus.APPROVED.value
+    assert audit_events[0].before["revoked_at"] is None
+    assert audit_events[0].after["status"] == MemoryStatus.REVOKED.value
+    assert audit_events[0].after["revoked_at"] == revoked.revoked_at
+
+
+def test_approve_rolls_back_candidate_and_memory_when_audit_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, candidate = seed_pending_candidate(tmp_path)
+    force_audit_id_collision(store, monkeypatch)
+
+    with pytest.raises(Exception, match="UNIQUE constraint failed"):
+        ReviewWorkflow(store).approve_candidate(candidate.candidate_id, actor="user")
+
+    assert store.get_candidate(candidate.candidate_id) == candidate
+    assert store.list_approved_memories() == []
+    assert [
+        event.audit_id for event in store.list_audit_events()
+    ] == ["audit-collision"]
+
+
+def test_revoke_rolls_back_memory_when_audit_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, candidate = seed_pending_candidate(tmp_path)
+    workflow = ReviewWorkflow(store)
+    memory = workflow.approve_candidate(candidate.candidate_id, actor="user")
+    force_audit_id_collision(store, monkeypatch)
+
+    with pytest.raises(Exception, match="UNIQUE constraint failed"):
+        workflow.revoke_memory(memory.memory_id, actor="user")
+
+    assert store.get_approved_memory(memory.memory_id) == memory
     assert [
         event.action for event in store.list_audit_events(memory.memory_id)
-    ] == [AuditAction.REVOKED]
+    ] == []
+
+
+def test_revoke_memory_blocks_double_revoke(tmp_path: Path) -> None:
+    store, candidate = seed_pending_candidate(tmp_path)
+    workflow = ReviewWorkflow(store)
+    memory = workflow.approve_candidate(candidate.candidate_id, actor="user")
+    workflow.revoke_memory(memory.memory_id, actor="user")
+
+    with pytest.raises(ReviewWorkflowError, match="not approved"):
+        workflow.revoke_memory(memory.memory_id, actor="user")
 
 
 def test_missing_candidate_raises_review_workflow_error(tmp_path: Path) -> None:
@@ -123,3 +183,30 @@ def test_missing_memory_raises_review_workflow_error(tmp_path: Path) -> None:
 
     with pytest.raises(ReviewWorkflowError, match="Approved memory missing not found"):
         ReviewWorkflow(store).revoke_memory("missing", actor="user")
+
+
+def force_audit_id_collision(
+    store: PersonalEvolutionStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store.append_audit(
+        AuditEvent(
+            audit_id="audit-collision",
+            entity_type="test",
+            entity_id="collision-seed",
+            action=AuditAction.CANDIDATE_CREATED,
+            actor="test",
+            before=None,
+            after=None,
+            reason=None,
+            created_at="2026-06-20T00:00:00+00:00",
+        )
+    )
+    original_stable_id = review_module._stable_id
+
+    def stable_id_with_audit_collision(prefix: str, *parts: str) -> str:
+        if prefix == "audit":
+            return "audit-collision"
+        return original_stable_id(prefix, *parts)
+
+    monkeypatch.setattr(review_module, "_stable_id", stable_id_with_audit_collision)

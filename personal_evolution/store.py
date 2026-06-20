@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -91,31 +93,8 @@ class PersonalEvolutionStore:
         return [ObservedEvent.from_dict(_observed_event_from_row(row)) for row in rows]
 
     def save_candidate(self, candidate: CandidateMemory) -> None:
-        data = candidate.to_dict()
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO candidates (
-                    candidate_id, memory_type, claim, rationale, evidence_ids_json,
-                    status, confidence, source_model, remote_assisted, created_at,
-                    updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    data["candidate_id"],
-                    data["memory_type"],
-                    data["claim"],
-                    data["rationale"],
-                    _dumps(data["evidence_ids"]),
-                    data["status"],
-                    data["confidence"],
-                    data["source_model"],
-                    int(data["remote_assisted"]),
-                    data["created_at"],
-                    data["updated_at"],
-                ),
-            )
+            _save_candidate(conn, candidate)
 
     def get_candidate(self, candidate_id: str) -> CandidateMemory | None:
         with self._connect() as conn:
@@ -140,30 +119,8 @@ class PersonalEvolutionStore:
         return [CandidateMemory.from_dict(_candidate_from_row(row)) for row in rows]
 
     def save_approved_memory(self, memory: ApprovedMemory) -> None:
-        data = memory.to_dict()
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO approved_memories (
-                    memory_id, memory_type, content, evidence_ids_json,
-                    candidate_id, version, confidence, status, approved_at,
-                    revoked_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    data["memory_id"],
-                    data["memory_type"],
-                    data["content"],
-                    _dumps(data["evidence_ids"]),
-                    data["candidate_id"],
-                    data["version"],
-                    data["confidence"],
-                    data["status"],
-                    data["approved_at"],
-                    data["revoked_at"],
-                ),
-            )
+            _save_approved_memory(conn, memory)
 
     def get_approved_memory(self, memory_id: str) -> ApprovedMemory | None:
         with self._connect() as conn:
@@ -181,28 +138,8 @@ class PersonalEvolutionStore:
         return [ApprovedMemory.from_dict(_approved_memory_from_row(row)) for row in rows]
 
     def append_audit(self, event: AuditEvent) -> None:
-        data = event.to_dict()
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO audit_events (
-                    audit_id, entity_type, entity_id, action, actor, before_json,
-                    after_json, reason, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    data["audit_id"],
-                    data["entity_type"],
-                    data["entity_id"],
-                    data["action"],
-                    data["actor"],
-                    _dumps(data["before"]),
-                    _dumps(data["after"]),
-                    data["reason"],
-                    data["created_at"],
-                ),
-            )
+            _append_audit(conn, event)
 
     def list_audit_events(self, entity_id: str | None = None) -> list[AuditEvent]:
         query = "SELECT rowid, * FROM audit_events"
@@ -215,6 +152,11 @@ class PersonalEvolutionStore:
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [AuditEvent.from_dict(_audit_event_from_row(row)) for row in rows]
+
+    @contextmanager
+    def transaction(self) -> Iterator[PersonalEvolutionTransaction]:
+        with self._connect() as conn:
+            yield PersonalEvolutionTransaction(conn)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -309,6 +251,97 @@ class PersonalEvolutionStore:
                     ON audit_events (created_at);
                 """
             )
+
+
+class PersonalEvolutionTransaction:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def save_candidate(self, candidate: CandidateMemory) -> None:
+        _save_candidate(self._conn, candidate)
+
+    def save_approved_memory(self, memory: ApprovedMemory) -> None:
+        _save_approved_memory(self._conn, memory)
+
+    def append_audit(self, event: AuditEvent) -> None:
+        _append_audit(self._conn, event)
+
+
+def _save_candidate(conn: sqlite3.Connection, candidate: CandidateMemory) -> None:
+    data = candidate.to_dict()
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO candidates (
+            candidate_id, memory_type, claim, rationale, evidence_ids_json,
+            status, confidence, source_model, remote_assisted, created_at,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            data["candidate_id"],
+            data["memory_type"],
+            data["claim"],
+            data["rationale"],
+            _dumps(data["evidence_ids"]),
+            data["status"],
+            data["confidence"],
+            data["source_model"],
+            int(data["remote_assisted"]),
+            data["created_at"],
+            data["updated_at"],
+        ),
+    )
+
+
+def _save_approved_memory(conn: sqlite3.Connection, memory: ApprovedMemory) -> None:
+    data = memory.to_dict()
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO approved_memories (
+            memory_id, memory_type, content, evidence_ids_json,
+            candidate_id, version, confidence, status, approved_at,
+            revoked_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            data["memory_id"],
+            data["memory_type"],
+            data["content"],
+            _dumps(data["evidence_ids"]),
+            data["candidate_id"],
+            data["version"],
+            data["confidence"],
+            data["status"],
+            data["approved_at"],
+            data["revoked_at"],
+        ),
+    )
+
+
+def _append_audit(conn: sqlite3.Connection, event: AuditEvent) -> None:
+    data = event.to_dict()
+    conn.execute(
+        """
+        INSERT INTO audit_events (
+            audit_id, entity_type, entity_id, action, actor, before_json,
+            after_json, reason, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            data["audit_id"],
+            data["entity_type"],
+            data["entity_id"],
+            data["action"],
+            data["actor"],
+            _dumps(data["before"]),
+            _dumps(data["after"]),
+            data["reason"],
+            data["created_at"],
+        ),
+    )
 
 
 def _dumps(value: Any) -> str:

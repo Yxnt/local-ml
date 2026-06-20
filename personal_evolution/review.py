@@ -45,19 +45,20 @@ class ReviewWorkflow:
             revoked_at=None,
         )
 
-        self.store.save_candidate(approved_candidate)
-        self.store.save_approved_memory(memory)
-        self.store.append_audit(
-            _audit_event(
-                entity_type="candidate",
-                entity_id=candidate.candidate_id,
-                action=AuditAction.APPROVED,
-                actor=actor,
-                before=candidate.to_dict(),
-                after=approved_candidate.to_dict(),
-                reason=reason,
+        with self.store.transaction() as tx:
+            tx.save_candidate(approved_candidate)
+            tx.save_approved_memory(memory)
+            tx.append_audit(
+                _audit_event(
+                    entity_type="candidate",
+                    entity_id=candidate.candidate_id,
+                    action=AuditAction.APPROVED,
+                    actor=actor,
+                    before=candidate.to_dict(),
+                    after=approved_candidate.to_dict(),
+                    reason=reason,
+                )
             )
-        )
         return memory
 
     def edit_and_approve_candidate(
@@ -83,19 +84,48 @@ class ReviewWorkflow:
             updated_at=utc_now_iso(),
         )
 
-        self.store.save_candidate(edited)
-        self.store.append_audit(
-            _audit_event(
-                entity_type="candidate",
-                entity_id=candidate.candidate_id,
-                action=AuditAction.CANDIDATE_EDITED,
-                actor=actor,
-                before=candidate.to_dict(),
-                after=edited.to_dict(),
-                reason=reason,
-            )
+        now = utc_now_iso()
+        approved_candidate = _candidate_with_status(edited, MemoryStatus.APPROVED, now)
+        memory = ApprovedMemory(
+            memory_id=_stable_id("memory", edited.candidate_id, edited.claim),
+            memory_type=edited.memory_type,
+            content=edited.claim,
+            evidence_ids=list(edited.evidence_ids),
+            candidate_id=edited.candidate_id,
+            version=1,
+            confidence=edited.confidence,
+            status=MemoryStatus.APPROVED,
+            approved_at=now,
+            revoked_at=None,
         )
-        return self.approve_candidate(candidate_id, actor=actor, reason=reason)
+
+        with self.store.transaction() as tx:
+            tx.save_candidate(edited)
+            tx.append_audit(
+                _audit_event(
+                    entity_type="candidate",
+                    entity_id=candidate.candidate_id,
+                    action=AuditAction.CANDIDATE_EDITED,
+                    actor=actor,
+                    before=candidate.to_dict(),
+                    after=edited.to_dict(),
+                    reason=reason,
+                )
+            )
+            tx.save_candidate(approved_candidate)
+            tx.save_approved_memory(memory)
+            tx.append_audit(
+                _audit_event(
+                    entity_type="candidate",
+                    entity_id=candidate.candidate_id,
+                    action=AuditAction.APPROVED,
+                    actor=actor,
+                    before=edited.to_dict(),
+                    after=approved_candidate.to_dict(),
+                    reason=reason,
+                )
+            )
+        return memory
 
     def reject_candidate(
         self,
@@ -107,18 +137,19 @@ class ReviewWorkflow:
         candidate = self._pending_candidate(candidate_id)
         rejected = _candidate_with_status(candidate, MemoryStatus.REJECTED, utc_now_iso())
 
-        self.store.save_candidate(rejected)
-        self.store.append_audit(
-            _audit_event(
-                entity_type="candidate",
-                entity_id=candidate.candidate_id,
-                action=AuditAction.REJECTED,
-                actor=actor,
-                before=candidate.to_dict(),
-                after=rejected.to_dict(),
-                reason=reason,
+        with self.store.transaction() as tx:
+            tx.save_candidate(rejected)
+            tx.append_audit(
+                _audit_event(
+                    entity_type="candidate",
+                    entity_id=candidate.candidate_id,
+                    action=AuditAction.REJECTED,
+                    actor=actor,
+                    before=candidate.to_dict(),
+                    after=rejected.to_dict(),
+                    reason=reason,
+                )
             )
-        )
         return rejected
 
     def revoke_memory(
@@ -149,18 +180,19 @@ class ReviewWorkflow:
             revoked_at=utc_now_iso(),
         )
 
-        self.store.save_approved_memory(revoked)
-        self.store.append_audit(
-            _audit_event(
-                entity_type="approved_memory",
-                entity_id=memory.memory_id,
-                action=AuditAction.REVOKED,
-                actor=actor,
-                before=memory.to_dict(),
-                after=revoked.to_dict(),
-                reason=reason,
+        with self.store.transaction() as tx:
+            tx.save_approved_memory(revoked)
+            tx.append_audit(
+                _audit_event(
+                    entity_type="approved_memory",
+                    entity_id=memory.memory_id,
+                    action=AuditAction.REVOKED,
+                    actor=actor,
+                    before=memory.to_dict(),
+                    after=revoked.to_dict(),
+                    reason=reason,
+                )
             )
-        )
         return revoked
 
     def _pending_candidate(self, candidate_id: str) -> CandidateMemory:

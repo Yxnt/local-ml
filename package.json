@@ -4,6 +4,6 @@
     "test": "node --test tests/js/minimal_pi_session.test.js"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.79.0"
+    "@earendil-works/pi-coding-agent": "^0.79.8"
   }
 }
